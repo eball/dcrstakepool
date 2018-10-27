@@ -5,10 +5,23 @@
     </div>
     <div class="col-sm-12 col-md-10 col-lg-8 center-block">
        <h1 class="text-center">Decred Stake Pool Overview</h1>
-       <p>A stake pool is used to delegate your voting powers to a third party (the pool). The pool <b>cannot</b> steal your funds.</p>
-       <p>Participating in a stake pool is perfect for people who wish to take part in Decred's proof of stake voting but can't due to:</p>
-       <ul><li>Not wanting to keep a constantly unlocked wallet</li>
-       <li>Lack of a realible/low latency Internet connection</li></ul>
+<h2>What is a Stake Pool?</h2>
+<p>Decred Stake Pool [Mega Pool] is set up and run by a group of strong believers of Decred governance mechanism. Our mission is to support the long-term development and evolution of Decred, together with all Decred holders. We are 24/7 online, waiting to vote on your behalf. </p>
+<p>The Proof of Stake system and voting play a big role in Decred governance. It makes possible that holders of Decred have a say in the governance of the currency. 1) PoS stakers validate the blocks the PoW miners mine. The PoS system rewards participants by distributing 30% of every block reward to tickets chosen to vote in that block. 2) PoS stakers vote on an agenda of Decred community. The development and future are decided by every stakeholder who participate.</p>
+<p>To be able to vote, a wallet needs to be online 24/7 to respond to a vote if one of your tickets is selected. The internet connection also affects whether a vote is successfully cast. Thus, solo voting by individuals not setting up with 24/7 servers are hard.</p>
+<p>A stake pool is basically a community run wallet to which you can assign the voting rights of your tickets and the pool will vote on your behalf. A stake pool implements multi-wallet redundancy by having many wallets physically distributed around the globe. In addition, every wallet is supported by high availability and superspeed connection to the Decred network. Thus, there is very low chance of your vote being missed. A pool charges a small percentage of fee (with us, 1%) to support such network infrastructure.</p>
+
+<h2>Is it SAFE?</h2>
+<p>You are only assigning voting rights to the pool, not your actual funds. A stake pool NEVER possesses or owns your assets, neither can a pool access your seeds or private keys. You are 100% SAFE to delegate your voting rights to a pool. </p>
+
+<h2>How does it work? </h2>
+<p>Decred PoS system adopts a multisig mechanism for delegating voting rights, which means either you or the pool can vote. The ticket purchase contains a consensus-enforced commitment for the final subsidy address. As a result, the PoS voting reward goes directly to your address, while the pool fee goes to support the operation of the pool. Your funds and rewards never get crossed with the pool.</p>
+
+<h2>IN SHORT:</h2>
+<p>A stake pool is used to delegate your voting powers to a third party (the pool). The pool CANNOT steal your funds.</p>
+<p>Participating in a stake pool is perfect for people who wish to take part in Decred's proof of stake voting but can't due to:</p>
+<p>·      Not wanting to keep a constantly unlocked wallet</p>
+<p>·      Lack of a realible/low latency Internet connection</p>
        <p>The source code is available at <a href="https://github.com/decred/dcrstakepool" target="_blank">GitHub.</a></p>
        <hr>
        <ul>
@@ -18,7 +31,7 @@
          <li>Support Email: <a href="mailto:{{.PoolEmail}}">{{.PoolEmail}}</a></li>
          <li>Support Link: <a href="{{.PoolLink}}" target="_blank">{{.PoolLink}}</a></li>
        </ul>
-    </div>   
+    </div>
     </div>
 	{{if not .User}}
      <div class="row row-button">

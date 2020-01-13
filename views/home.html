@@ -1,136 +1,79 @@
 {{define "home"}}
-<section class="site-content">
-<div class="container">
-  <div class="row mx-3">
-    <div class="col-md-6 col-12">
-      <div class="row">
-        <section class="block">
-          <div class="col-12 block__title">
-            <h1><span>Voting Service Provider Overview</span></h1>
-          </div>
-          <div class="col-12 mb-4 block__content">
-            <p>Voting Service Providers (VSPs) allow you to participate in Decred’s proof-of-stake (PoS) system without the need to keep a constantly unlocked wallet or worry about losses due to downtime, flaky internet.</p>
-
-            <p>VSPs are used to delegate your voting powers. The VSP can cast a vote on your behalf when a ticket is called to vote. VSPs do not hold, manage, or transfer any of your DCR funds. The VSP cannot steal your funds.</p>
-
-            <p>{{$.CustomDescription}}</p>
-
-            <p>Support email:&nbsp;<a href="mailto:{{$.PoolEmail}}" rel="noopener noreferrer">{{$.PoolEmail}}</a></p>
-
-            {{if not .User}}
-              <a href="/register" class="btn btn-outline-primary btn-outline-primary--inverted d-lg-inline-block d-block mb-3">Register</a>
-            {{end}}
-            <a href="{{.PoolLink}}" rel="noopener noreferrer" class="btn btn-outline-primary d-lg-inline-block d-block mb-3">Support</a>
-          </div>
-        </section>
-      </div>
-      <div class="row">
-        <div class="main-carousel">
-          <div class="carousel-cell">
-            <div class="row">
-              <div class="col-lg-5 col-12 main-carousel__image-container px-0 pl-lg-3">
-                <picture>
-                  <source media="(min-width: 992px)" srcset="/assets/images/1-panel-desktop.png">
-                  <source media="(min-width: 768px)" srcset="/assets/images/1-panel-tablet.png">
-                  <img src="/assets/images/1-panel-mobile.png" class="img-fluid">
-                </picture>
-              </div>
-              <div class="col-lg-7 col-12 block__content">
-                <h2>What is Staking?</h2>
-                <p>Staking (PoS) allows users to participate in Decred’s Governance. To have your say, you can lock up your DCR funds in return for tickets. Participants are given a real voice in the decision-making and rewarded for engagement in the projects governance.</p>
-                <p>Participation in Staking (PoS) is open to everyone and requires time-locking a portion of your DCR in return for tickets. Current price of a ticket is <span>{{printf "%0.2f" .StakeInfo.Difficulty}}&nbsp;DCR</span></p>
-              </div>
-            </div>
-          </div>
-          <div class="carousel-cell">
-            <div class="row">
-              <div class="col-lg-5 col-12 main-carousel__image-container px-0 pl-lg-3">
-                <picture>
-                  <source media="(min-width: 992px)" srcset="/assets/images/2-panel-desktop.png">
-                  <source media="(min-width: 768px)" srcset="/assets/images/2-panel-tablet.png">
-                  <img src="/assets/images/2-panel-mobile.png" class="img-fluid">
-                </picture>
-              </div>
-              <div class="col-lg-7 col-12 block__content">
-                <h2>What are Tickets?</h2>
-                <p>The purpose of these tickets is twofold: 
-                - Firstly they serve an automatic function of voting on the validity of new blocks. 
-                - Secondly they grant the right to partake in the decision-making processes which determines the future of Decred.</p>
-                <p>The process of staking is essentially like a lottery, where tickets are chosen to vote randomly.</p>
-              </div>
-            </div>
-          </div>
-          <div class="carousel-cell">
-            <div class="row">
-              <div class="col-lg-5 col-12 main-carousel__image-container px-0 pl-lg-3">
-                <picture>
-                  <source media="(min-width: 992px)" srcset="/assets/images/3-panel-desktop.png">
-                  <source media="(min-width: 768px)" srcset="/assets/images/3-panel-tablet.png">
-                  <img src="/assets/images/3-panel-mobile.png" class="img-fluid">
-                </picture>
-              </div>
-              <div class="col-lg-7 col-12 block__content">
-                <h2>Profitability</h2>
-                <p>A successful vote returns the participant the original cost of the ticket and a part of the blockreward as profit.</p>
-                <p>In case the vote misses (0.5% probability), original cost of the ticket is safely returned without the reward. Average time for a ticket to vote is within 28 days and maximum up to 142 days.</p>
-              </div>
-            </div>
-          </div>
-        </div>
-        <ul class="carousel-nav col-lg-7 col-12">
-        </ul>
-      </div>
+<div class="wrapper">
+	    <div class="row main-row">
+ <div class="col-xs-15 col-md-8 col-lg-8 notication-col center-block">
     </div>
-    <div class="col-md-6 col-12">
-      <div class="row ml-1">
-        <section class="block">
-          <div class="col-12 block__title">
-            <h1><span>Information</span></h1>
-          </div>
-          <div class="col-12 mb-4 block__content">
-            <div class="row mb-3">
-              <div class="col-6">
-                <div class="d-lg-flex align-items-start align-items-lg-center">
-                  <img class="mb-lg-0 mb-1" src="/assets/images/group-1079.svg" alt="">
-                  <p class="ml-lg-3 mb-0"><strong>VSP fee:</strong> {{ .PoolFees }}%</p>
-                </div>
-              </div>
-              <div class="col-6">
-                <div class="d-lg-flex align-items-start align-items-lg-center">
-                  <img class="mb-lg-0 mb-1" src="/assets/images/circular-graphic-with-quarter-portion.svg" alt="">
-                  <p class="ml-lg-3 mb-0"><strong>Proportion:</strong> {{ printf "%.2f" .LivePercent }}%</p>
-                </div>
-              </div>
-            </div>
-            <div class="row mb-3">
-              <div class="col-6">
-                <div class="d-lg-flex align-items-start align-items-lg-center">
-                  <img class="mb-lg-0 mb-1" src="/assets/images/servers.svg" alt="">
-                  <p class="ml-lg-3 mb-0"><strong>Network:</strong> {{ .Network }}</p>
-                </div>
-              </div>
-              <div class="col-6">
-                <div class="d-lg-flex align-items-start align-items-lg-center">
-                  <img class="mb-lg-0 mb-1" src="/assets/images/status.svg" alt="">
-                  <p class="ml-lg-3 mb-0"><strong>Status:</strong> {{if .IsClosed}}Closed{{else}}Open{{end}}</p>
-                </div>
-              </div>
-            </div>
-          </div>
-        </section>
-      </div>
-      <div class="row ml-1">
-        <div class="col-12 block__content">
-          <h2>All Voting Service Providers</h2>
-          <p>To encourage decentralization of the network, it is recommended to avoid VSPs that have over 5% of network votes.</p>
-          <div id="stakepool-data" data-ismainnet="{{ if eq .Network "mainnet"}}true{{else}}false{{end}}" class="table-scroll-y text-nowrap mb-4">
-            <noscript>
-              <div class="row col-12 block__description">
-                <p>Enable Javascript to see all available VSPs</p>
-              </div>
-            </noscript>
-          </div>
-        </div>
+    <div class="col-sm-12 col-md-10 col-lg-8 center-block">
+       <h1 class="text-center">Decred(德信币)票池 Mega Pool简介</h1>
+<h2>我们的信仰及票池介绍</h2>
+	    <p>Mega Pool 票池是由一群相信Decred治理模式的小伙伴发起运营。我们的使命是，与所有DCR持有者一起支持DCR的长期发展和演变。我们7x24小时在线，接受你的委托并进行投票。</p>
+<p>权益证明和投票在Decred治理中扮演着举足轻重的角色，使得DCR持有者在DCR的治理上获得参与权和治理权：第一、DCR持有者投票验证PoW矿工挖到的每一个块，投票参与者会收到被验证区块的30%区块奖励做为PoS奖励；第二、DCR持有者参与DCR社区未来发展计划的决策。每一个参与的持币者共同决定了Decred的发展和未来。</p>
+<p>投票的要求是，钱包需要7x24小时在线，以便在自己的选票被主网络随机征召到时可以迅速回应并投票。网络连接质量也会影响投票动作是否成功进行。所以，不具备7x24在线网络或者钱包的个人持币者参与投票无法保证较高的投票成功率，从而产生损失。</p>
+<p>票池为解决这个问题应运而生，简单来说是由社区运营的在线钱包，你可以将自己的投票权委托与其并代由你进行投票。票池通常在全球多个地点部署钱包，保证多钱包冗余并可用。每个钱包需要有高可用的网络和服务器，保持与Decred网络的顺畅网络连接。如此一来，票池投票的丢票率就非常低。票池会收取一定费用（于我们，投票收益的1%）来支付运营票池网络和服务器的成本。</p>
+<h2>使用票池安全么？</h2>
+	    <p>使用票池只会将你的投票权委托给票池，你的DCR币不会转移依然属于自己。票池无法拥有或染指你的资产/币，也没有办法获得你的钱包种子或者私钥。使用票池委托投票对你的资产/币是绝对安全的。</p>
+<h2>安全机制如何实现的？</h2>
+<p>Decrd的权益证明系统使用了多重签名机制来委托投票权，委托后你或者票池均可为你的该选票投票。选票购买过程使用了共识承诺来保证最终投票收益将独立返还。你的投票收益会直接进入你的DCR币地址（不经过票池），补贴票池运营的投票委托费将单独进入票池地址。你的收益不经过票池，也不会和票池混杂。</p>
+<h2>简单总结：</h2>
+	    <p>票池受委托于你，在你的选票在被征召时行使投票权。票池无法触碰或盗取你的数字货币。</p>
+	    <p>使用票池是持币者最好的参与Decred治理和权益证明投票的方式，在以下情况下：</p>
+	    <p>·      当持币者无法7x24小时保持钱包在线并为解锁状态时；</p>
+	    <p>·      当持币者无法保持非常稳定和低延迟的网络连接时。</p>
+<p>获取票池源代码，请点击这里<a href="https://github.com/decred/dcrstakepool" target="_blank">GitHub.</a></p>
+<hr>
+
+<ul>
+<li class="li-heading">票池简要信息</li>
+<li>使用网络：{{.Network}}</li>
+<li>票池费用：{{.PoolFees}}%%的投票收益</li>
+<li>联系邮箱：<a href="mailto:{{.PoolEmail}}">{{.PoolEmail}}</a></li>
+<li>联系网址：<a href="{{.PoolLink}}" target="_blank">{{.PoolLink}}</a></li>
+</ul>
+    </div>
+    </div>
+<br/>
+<br/>
+<br/>
+<br/>
+
+    <div class="row main-row">
+ <div class="col-xs-15 col-md-8 col-lg-8 notication-col center-block">
+    </div>
+    <div class="col-sm-12 col-md-10 col-lg-8 center-block">
+       <h1 class="text-center">Mega Pool Overview</h1>
+<h2>What is a Stake Pool?</h2>
+<p>Mega Pool, a Decred Stake Pool, is set up and run by a group of strong believers of Decred governance mechanism. Our mission is to support the long-term development and evolution of Decred, together with all Decred holders. We are 24/7 online, waiting to vote on your behalf. </p>
+<p>The Proof of Stake system and voting play a big role in Decred governance. It makes possible that holders of Decred have a say in the governance of the currency. 1) PoS stakers validate the blocks the PoW miners mine. The PoS system rewards participants by distributing 30% of every block reward to tickets chosen to vote in that block. 2) PoS stakers vote on an agenda of Decred community. The development and future are decided by every stakeholder who participate.</p>
+<p>To be able to vote, a wallet needs to be online 24/7 to respond to a vote if one of your tickets is selected. The internet connection also affects whether a vote is successfully cast. Thus, solo voting by individuals not setting up with 24/7 servers are hard.</p>
+<p>A stake pool is basically a community run wallet to which you can assign the voting rights of your tickets and the pool will vote on your behalf. A stake pool implements multi-wallet redundancy by having many wallets physically distributed around the globe. In addition, every wallet is supported by high availability and superspeed connection to the Decred network. Thus, there is very low chance of your vote being missed. A pool charges a small percentage of fee (with us, 1%) to support such network infrastructure.</p>
+
+<h2>Is it SAFE?</h2>
+<p>You are only assigning voting rights to the pool, not your actual funds. A stake pool NEVER possesses or owns your assets, neither can a pool access your seeds or private keys. You are 100% SAFE to delegate your voting rights to a pool. </p>
+
+<h2>How does it work? </h2>
+<p>Decred PoS system adopts a multisig mechanism for delegating voting rights, which means either you or the pool can vote. The ticket purchase contains a consensus-enforced commitment for the final subsidy address. As a result, the PoS voting reward goes directly to your address, while the pool fee goes to support the operation of the pool. Your funds and rewards never get crossed with the pool.</p>
+
+<h2>IN SHORT:</h2>
+<p>A stake pool is used to delegate your voting powers to a third party (the pool). The pool CANNOT steal your funds.</p>
+<p>Participating in a stake pool is perfect for people who wish to take part in Decred's proof of stake voting but can't due to:</p>
+	    <p>·      Not wanting to keep a constantly unlocked wallet</p>
+	    <p>·      Lack of a reliable/low latency Internet connection</p>
+       <p>The source code is available at <a href="https://github.com/decred/dcrstakepool" target="_blank">GitHub.</a></p>
+       <hr>
+       <ul>
+         <li class="li-heading">Pool Information</li>
+         <li>Network: {{.Network}}</li>
+         <li>Pool Fees: {{.PoolFees}}%</li>
+         <li>Support Email: <a href="mailto:{{.PoolEmail}}">{{.PoolEmail}}</a></li>
+         <li>Support Link: <a href="{{.PoolLink}}" target="_blank">{{.PoolLink}}</a></li>
+       </ul>
+    </div>
+    </div>
+
+	{{if not .User}}
+     <div class="row row-button">
+      <div class="col-sm-15 col-md-6 center-block text-center">
+        <a href="/signup" class="btn btn-primary" role="button">Sign Up</a>
       </div>
     </div>
   </div>

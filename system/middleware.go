@@ -1,21 +1,21 @@
 package system
 
 import (
-	"crypto/rand"
-	"crypto/sha256"
-	"crypto/subtle"
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/decred/dcrstakepool/models"
 	"github.com/dgrijalva/jwt-go"
 	"github.com/go-gorp/gorp"
 	"github.com/gorilla/sessions"
 	"github.com/zenazn/goji/web"
+	gojimw "github.com/zenazn/goji/web/middleware"
+	"github.com/zenazn/goji/web/mutil"
 )
 
-// Makes sure templates are stored in the context
+// ApplyTemplates makes sure templates are stored in the context
 func (application *Application) ApplyTemplates(c *web.C, h http.Handler) http.Handler {
 	fn := func(w http.ResponseWriter, r *http.Request) {
 		c.Env["Template"] = application.Template
@@ -24,10 +24,13 @@ func (application *Application) ApplyTemplates(c *web.C, h http.Handler) http.Ha
 	return http.HandlerFunc(fn)
 }
 
-// Makes sure controllers can have access to session
+// ApplySessions makes sure controllers can have access to session
 func (application *Application) ApplySessions(c *web.C, h http.Handler) http.Handler {
 	fn := func(w http.ResponseWriter, r *http.Request) {
-		session, _ := application.Store.Get(r, "session")
+		session, err := application.Store.New(r, "session")
+		if err != nil {
+			log.Warnf("session load err: %v ", err)
+		}
 		c.Env["Session"] = session
 		h.ServeHTTP(w, r)
 	}
@@ -45,7 +48,6 @@ func (application *Application) ApplyDbMap(c *web.C, h http.Handler) http.Handle
 func (application *Application) ApplyAPI(c *web.C, h http.Handler) http.Handler {
 	fn := func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(r.URL.Path, "/api") {
-			c.Env["IsAPI"] = true
 			authHeader := r.Header.Get("Authorization")
 			if strings.HasPrefix(authHeader, "Bearer ") {
 				apitoken := strings.TrimPrefix(authHeader, "Bearer ")
@@ -53,29 +55,38 @@ func (application *Application) ApplyAPI(c *web.C, h http.Handler) http.Handler 
 				JWTtoken, err := jwt.Parse(apitoken, func(token *jwt.Token) (interface{}, error) {
 					// validate signing algorithm
 					if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
-						return nil, fmt.Errorf("Unexpected signing method: %v", token.Header["alg"])
+						return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
 					}
 					return []byte(application.APISecret), nil
 				})
 
 				if err != nil {
 					log.Warnf("invalid token %v: %v", apitoken, err)
-				} else {
-					if claims, ok := JWTtoken.Claims.(jwt.MapClaims); ok && JWTtoken.Valid {
-						dbMap := c.Env["DbMap"].(*gorp.DbMap)
+				} else if claims, ok := JWTtoken.Claims.(jwt.MapClaims); ok && JWTtoken.Valid {
+					dbMap := c.Env["DbMap"].(*gorp.DbMap)
 
-						user, err := models.GetUserById(dbMap, int64(claims["loggedInAs"].(float64)))
-						if err != nil {
-							log.Errorf("unable to map apitoken %v to user id %v", apitoken, claims["loggedInAs"])
-						} else {
-							c.Env["APIUserID"] = user.Id
-							log.Infof("mapped apitoken %v to user id %v", apitoken, user.Id)
-						}
+					user, err := models.GetUserById(dbMap, int64(claims["loggedInAs"].(float64)))
+					if err != nil {
+						log.Errorf("unable to map apitoken %v to user id %v", apitoken, claims["loggedInAs"])
+					} else {
+						c.Env["APIUserID"] = user.Id
+						log.Infof("mapped apitoken %v to user id %v", apitoken, user.Id)
 					}
 				}
 			}
+		}
+		h.ServeHTTP(w, r)
+	}
+	return http.HandlerFunc(fn)
+}
+
+func (application *Application) ApplyCaptcha(c *web.C, h http.Handler) http.Handler {
+	fn := func(w http.ResponseWriter, r *http.Request) {
+		session := c.Env["Session"].(*sessions.Session)
+		if done, ok := session.Values["CaptchaDone"].(bool); ok {
+			c.Env["CaptchaDone"] = done
 		} else {
-			c.Env["IsAPI"] = false
+			c.Env["CaptchaDone"] = false
 		}
 		h.ServeHTTP(w, r)
 	}
@@ -85,7 +96,7 @@ func (application *Application) ApplyAPI(c *web.C, h http.Handler) http.Handler 
 func (application *Application) ApplyAuth(c *web.C, h http.Handler) http.Handler {
 	fn := func(w http.ResponseWriter, r *http.Request) {
 		session := c.Env["Session"].(*sessions.Session)
-		if userId, ok := session.Values["UserId"]; ok {
+		if userId := session.Values["UserId"]; userId != nil {
 			dbMap := c.Env["DbMap"].(*gorp.DbMap)
 
 			user, err := dbMap.Get(models.User{}, userId)
@@ -101,94 +112,30 @@ func (application *Application) ApplyAuth(c *web.C, h http.Handler) http.Handler
 	return http.HandlerFunc(fn)
 }
 
-func (application *Application) ApplyIsXhr(c *web.C, h http.Handler) http.Handler {
-	fn := func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("X-Requested-With") == "XMLHttpRequest" {
-			c.Env["IsXhr"] = true
-		} else {
-			c.Env["IsXhr"] = false
+// Logger is a middleware that logs the start and end of each request, along
+// with some useful data about what was requested, what the response status was,
+// and how long it took to return. This should be used after the RequestID
+// middleware.
+func Logger(RealIPHeader string) func(c *web.C, h http.Handler) http.Handler {
+	return func(c *web.C, h http.Handler) http.Handler {
+		fn := func(w http.ResponseWriter, r *http.Request) {
+			reqID := gojimw.GetReqID(*c)
+
+			log.Tracef("[%s] Started %s %q, from %s", reqID, r.Method,
+				r.URL.String(), ClientIP(r, RealIPHeader))
+
+			lw := mutil.WrapWriter(w)
+
+			t1 := time.Now()
+			h.ServeHTTP(lw, r)
+
+			if lw.Status() == 0 {
+				lw.WriteHeader(http.StatusOK)
+			}
+			t2 := time.Now()
+
+			log.Tracef("[%s] Returning %03d in %s", reqID, lw.Status(), t2.Sub(t1))
 		}
-		h.ServeHTTP(w, r)
+		return http.HandlerFunc(fn)
 	}
-	return http.HandlerFunc(fn)
-}
-
-func isValidToken(a, b string) bool {
-	x := []byte(a)
-	y := []byte(b)
-	if len(x) != len(y) {
-		return false
-	}
-	return subtle.ConstantTimeCompare(x, y) == 1
-}
-
-var csrfProtectionMethodForNoXhr = []string{"POST", "PUT", "DELETE"}
-
-func isCsrfProtectionMethodForNoXhr(method string) bool {
-	return strInSlice(csrfProtectionMethodForNoXhr, strings.ToUpper(method)) >= 0
-}
-
-func strInSlice(strs []string, str string) int {
-	for i, v := range strs {
-		if str == v {
-			return i
-		}
-	}
-	return -1
-}
-
-func (application *Application) ApplyCsrfProtection(c *web.C, h http.Handler) http.Handler {
-	fn := func(w http.ResponseWriter, r *http.Request) {
-		// disable CSRF for API requests
-		if c.Env["IsAPI"] != nil {
-			if c.Env["IsAPI"].(bool) {
-				h.ServeHTTP(w, r)
-				return
-			}
-		} else {
-			log.Error("IsAPI not set -- middleware not called in proper order")
-		}
-		session := c.Env["Session"].(*sessions.Session)
-		csrfProtection := application.CsrfProtection
-		if _, ok := session.Values["CsrfToken"]; !ok {
-			hash := sha256.New()
-			buffer := make([]byte, 32)
-			_, err := rand.Read(buffer)
-			if err != nil {
-				log.Criticalf("crypt/rand.Read failed: %s", err)
-				panic(err)
-			}
-			hash.Write(buffer)
-			session.Values["CsrfToken"] = fmt.Sprintf("%x", hash.Sum(nil))
-			if err = session.Save(r, w); err != nil {
-				log.Criticalf("session.Save() failed")
-				panic(err)
-			}
-		}
-		c.Env["CsrfKey"] = csrfProtection.Key
-		c.Env["CsrfToken"] = session.Values["CsrfToken"]
-		csrfToken := c.Env["CsrfToken"].(string)
-
-		if c.Env["IsXhr"].(bool) {
-			if !isValidToken(csrfToken, r.Header.Get(csrfProtection.Header)) {
-				http.Error(w, "Invalid Csrf Header", http.StatusBadRequest)
-				return
-			}
-		} else {
-			if isCsrfProtectionMethodForNoXhr(r.Method) {
-				if !isValidToken(csrfToken, r.PostFormValue(csrfProtection.Key)) {
-					http.Error(w, "Invalid Csrf Token", http.StatusBadRequest)
-					return
-				}
-			}
-		}
-		http.SetCookie(w, &http.Cookie{
-			Name:   csrfProtection.Cookie,
-			Value:  csrfToken,
-			Secure: csrfProtection.Secure,
-			Path:   "/",
-		})
-		h.ServeHTTP(w, r)
-	}
-	return http.HandlerFunc(fn)
 }

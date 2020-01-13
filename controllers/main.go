@@ -1,54 +1,76 @@
+// Copyright (c) 2016-2019 The Decred developers
+// Use of this source code is governed by an ISC
+// license that can be found in the LICENSE file.
+
 package controllers
 
 import (
-	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"html/template"
+	"io/ioutil"
 	"net"
 	"net/http"
-	"net/smtp"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
-	"github.com/decred/dcrd/chaincfg"
+	"github.com/dchest/captcha"
 	"github.com/decred/dcrd/chaincfg/chainhash"
-	"github.com/decred/dcrd/dcrjson"
-	"github.com/decred/dcrd/dcrutil"
-	"github.com/decred/dcrd/hdkeychain"
+	"github.com/decred/dcrd/chaincfg/v2"
+	"github.com/decred/dcrd/dcrutil/v2"
+	"github.com/decred/dcrd/hdkeychain/v2"
+	dcrdatatypes "github.com/decred/dcrdata/api/types/v4"
+	"github.com/decred/dcrstakepool/email"
 	"github.com/decred/dcrstakepool/helpers"
+	"github.com/decred/dcrstakepool/internal/version"
 	"github.com/decred/dcrstakepool/models"
 	"github.com/decred/dcrstakepool/poolapi"
 	"github.com/decred/dcrstakepool/stakepooldclient"
 	"github.com/decred/dcrstakepool/system"
-	"github.com/decred/dcrwallet/wallet/udb"
 	"github.com/go-gorp/gorp"
-	"github.com/haisum/recaptcha"
+	"github.com/gorilla/csrf"
 	"github.com/zenazn/goji/web"
 
-	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/connectivity"
 )
 
-var (
-	// MaxUsers is the maximum number of users supported by a stake pool.
+const (
+	// MaxUsers is the maximum number of users supported by a voting service.
 	// This is an artificial limit and can be increased by adjusting the
 	// ticket/fee address indexes above 10000.
-	MaxUsers            = 10000
-	signupEmailSubject  = "Stake pool email verification"
-	signupEmailTemplate = "A request for an account for __URL__\r\n" +
-		"was made from __REMOTEIP__ for this email address.\r\n\n" +
-		"If you made this request, follow the link below:\r\n\n" +
-		"__URL__/emailverify?t=__TOKEN__\r\n\n" +
-		"to verify your email address and finalize registration.\r\n\n"
-	StakepooldUpdateKindAll     = "ALL"
-	StakepooldUpdateKindUsers   = "USERS"
-	StakepooldUpdateKindTickets = "TICKETS"
+	// TODO Remove this limitation by deriving fee addresses from an imported xpub.
+	MaxUsers = 10000
+	// agendasCacheLife is the amount of time to keep agenda data in memory.
+	agendasCacheLife = time.Hour
 )
+
+type Config struct {
+	AdminIPs             []string
+	AdminUserIDs         []string
+	APISecret            string
+	BaseURL              string
+	ClosePool            bool
+	ClosePoolMsg         string
+	PoolEmail            string
+	PoolFees             float64
+	PoolLink             string
+	RealIPHeader         string
+	MaxVotedTickets      int
+	Description          string
+	Designation          string
+	APIVersionsSupported []int
+	FeeXpub              *hdkeychain.ExtendedKey
+	StakepooldServers    *stakepooldclient.StakepooldManager
+	EmailSender          email.Sender
+	VotingXpub           *hdkeychain.ExtendedKey
+
+	NetParams *chaincfg.Params
+}
 
 // MainController is the wallet RPC controller type.  Its methods include the
 // route handlers.
@@ -56,38 +78,29 @@ type MainController struct {
 	// embed type for c.Env[""] context and ExecuteTemplate helpers
 	system.Controller
 
-	adminIPs             []string
-	adminUserIDs         []string
-	APISecret            string
-	APIVersionsSupported []int
-	baseURL              string
-	closePool            bool
-	closePoolMsg         string
-	enableStakepoold     bool
-	feeXpub              *hdkeychain.ExtendedKey
-	grpcConnections      []*grpc.ClientConn
-	poolEmail            string
-	poolFees             float64
-	poolLink             string
-	params               *chaincfg.Params
-	rpcServers           *walletSvrManager
-	realIPHeader         string
-	recaptchaSecret      string
-	recaptchaSiteKey     string
-	smtpFrom             string
-	smtpHost             string
-	smtpUsername         string
-	smtpPassword         string
-	version              string
-	voteVersion          uint32
-	votingXpub           *hdkeychain.ExtendedKey
-	maxVotedAge          int64
+	Cfg            *Config
+	captchaHandler *CaptchaHandler
+	voteVersion    uint32
+	DCRDataURL     string
 }
 
-func randToken() string {
-	b := make([]byte, 16)
-	rand.Read(b)
-	return fmt.Sprintf("%x", b)
+// agendasCache holds the current available agendas for agendasCacheLife. Should
+// be accessed through MainController's agendas method.
+var agendasCache agendasMux
+
+// agenda links an agenda to its status. Possible statuses are upcoming,
+// in progress, finished, failed, or locked in.
+type agenda struct {
+	Agenda chaincfg.ConsensusDeployment
+	Status string
+}
+
+// agendasMux allows for concurrency safe access to agendasCache. Lock must be
+// held for read/writes.
+type agendasMux struct {
+	sync.Mutex
+	timer   time.Time
+	agendas *[]agenda
 }
 
 // Get the client's real IP address using the X-Real-IP header, or if that is
@@ -112,87 +125,118 @@ func getClientIP(r *http.Request, realIPHeader string) string {
 }
 
 // NewMainController is the constructor for the entire controller routing.
-func NewMainController(params *chaincfg.Params, adminIPs []string,
-	adminUserIDs []string, APISecret string, APIVersionsSupported []int,
-	baseURL string, closePool bool, closePoolMsg string, enablestakepoold bool,
-	feeXpubStr string,
-	grpcConnections []*grpc.ClientConn, poolFees float64, poolEmail, poolLink,
-	recaptchaSecret, recaptchaSiteKey string, smtpFrom, smtpHost, smtpUsername,
-	smtpPassword, version string, walletHosts, walletCerts, walletUsers,
-	walletPasswords []string, minServers int, realIPHeader,
-	votingXpubStr string, maxVotedAge int64) (*MainController, error) {
-
-	// Parse the extended public key and the pool fees.
-	feeKey, err := hdkeychain.NewKeyFromString(feeXpubStr)
-	if err != nil {
-		return nil, err
-	}
-	if !feeKey.IsForNet(params) {
-		return nil, fmt.Errorf("fee extended public key is for wrong network")
-	}
-
-	// Parse the extended public key for the voting addresses.
-	voteKey, err := hdkeychain.NewKeyFromString(votingXpubStr)
-	if err != nil {
-		return nil, err
-	}
-	if !voteKey.IsForNet(params) {
-		return nil, fmt.Errorf("voting extended public key is for wrong network")
-	}
-
-	rpcs, err := newWalletSvrManager(walletHosts, walletCerts, walletUsers, walletPasswords, minServers)
-	if err != nil {
-		return nil, err
+func NewMainController(cfg *Config) (*MainController, error) {
+	ch := &CaptchaHandler{
+		ImgHeight: 127,
+		ImgWidth:  257,
 	}
 
 	mc := &MainController{
-		adminIPs:             adminIPs,
-		adminUserIDs:         adminUserIDs,
-		APISecret:            APISecret,
-		APIVersionsSupported: APIVersionsSupported,
-		baseURL:              baseURL,
-		closePool:            closePool,
-		closePoolMsg:         closePoolMsg,
-		enableStakepoold:     enablestakepoold,
-		feeXpub:              feeKey,
-		grpcConnections:      grpcConnections,
-		poolEmail:            poolEmail,
-		poolFees:             poolFees,
-		poolLink:             poolLink,
-		params:               params,
-		recaptchaSecret:      recaptchaSecret,
-		recaptchaSiteKey:     recaptchaSiteKey,
-		rpcServers:           rpcs,
-		realIPHeader:         realIPHeader,
-		smtpFrom:             smtpFrom,
-		smtpHost:             smtpHost,
-		smtpUsername:         smtpUsername,
-		smtpPassword:         smtpPassword,
-		version:              version,
-		votingXpub:           voteKey,
-		maxVotedAge:          maxVotedAge,
+		Cfg:            cfg,
+		captchaHandler: ch,
 	}
 
-	voteVersion, err := mc.GetVoteVersion()
-	if err != nil || voteVersion == 0 {
+	walletInfo, err := cfg.StakepooldServers.WalletInfo()
+	if err != nil {
 		cErr := fmt.Errorf("Failed to get wallets' Vote Version: %v", err)
 		return nil, cErr
 	}
 
-	mc.voteVersion = voteVersion
+	// Ensure vote version matches on all wallets
+	lastVersion := uint32(0)
+	var lastServer int
+	firstrun := true
+	for k, v := range walletInfo {
+		if firstrun {
+			firstrun = false
+			lastVersion = v.VoteVersion
+		}
+
+		if v.VoteVersion != lastVersion {
+			vErr := fmt.Errorf("wallets %d and %d have mismatched vote versions",
+				k, lastServer)
+			return nil, vErr
+		}
+
+		lastServer = k
+	}
+
+	log.Infof("All wallets are VoteVersion %d", lastVersion)
+
+	mc.voteVersion = lastVersion
+
+	mc.DCRDataURL = fmt.Sprintf("https://%s.dcrdata.org", mc.getNetworkName())
 
 	return mc, nil
 }
 
 // getNetworkName will strip any suffix from a network name starting with
-// "testnet" (e.g. "testnet2"). This is primarily intended for the tickets page,
+// "testnet" (e.g. "testnet3"). This is primarily intended for the tickets page,
 // which generates block explorer links using a value set by the network string,
-// which is a problem since there is no testnet2.decred.org host.
+// which is a problem since there is no testnet3.dcrdata.org host.
 func (controller *MainController) getNetworkName() string {
-	if strings.HasPrefix(controller.params.Name, "testnet") {
+	if strings.HasPrefix(controller.Cfg.NetParams.Name, "testnet") {
 		return "testnet"
 	}
-	return controller.params.Name
+	return controller.Cfg.NetParams.Name
+}
+
+// agendas returns agendas and their statuses. Fetches agenda status from
+// dcrdata.org if past agenda.Timer limit from previous fetch. Caches agenda
+// data for agendasCacheLife. This method is safe for concurrent use.
+func (controller *MainController) agendas() []agenda {
+	agendasCache.Lock()
+	defer agendasCache.Unlock()
+	now := time.Now()
+	if agendasCache.timer.After(now) {
+		return *agendasCache.agendas
+	}
+	agendasCache.timer = now.Add(agendasCacheLife)
+	url := fmt.Sprintf("%s/api/agendas", controller.DCRDataURL)
+	agendaInfos, err := dcrDataAgendas(url)
+	if err != nil {
+		// Ensure the next call tries to fetch statuses again.
+		agendasCache.timer = time.Time{}
+		log.Warnf("unable to retrieve data from %v: %v", url, err)
+		// If we have initialized agendas, return that.
+		if agendasCache.agendas != nil {
+			return *agendasCache.agendas
+		}
+	}
+	agendaArray := controller.getAgendas()
+	agendasNew := make([]agenda, len(agendaArray))
+	// populate agendas
+	for n, agenda := range agendaArray {
+		agendasNew[n].Agenda = agenda
+		// find status for id
+		for _, info := range agendaInfos {
+			if info.Name == agenda.Vote.Id {
+				agendasNew[n].Status = info.Status.String()
+				break
+			}
+		}
+	}
+	agendasCache.agendas = &agendasNew
+	return *agendasCache.agendas
+}
+
+// dcrDataAgendas gets json data for current agendas from url. url is either
+// https://testnet.dcrdata.org/api/agendas or https://mainnet.dcrdata.org/api/agendas
+func dcrDataAgendas(url string) ([]*dcrdatatypes.AgendasInfo, error) {
+	resp, err := http.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	data, err := ioutil.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil {
+		return nil, err
+	}
+	a := []*dcrdatatypes.AgendasInfo{}
+	if err = json.Unmarshal(data, &a); err != nil {
+		return nil, err
+	}
+	return a, nil
 }
 
 // API is the main frontend that handles all API requests.
@@ -253,22 +297,8 @@ func (controller *MainController) APIAddress(c web.C, r *http.Request) ([]string
 
 	userPubKeyAddr := r.FormValue("UserPubKeyAddr")
 
-	if len(userPubKeyAddr) < 40 {
-		return nil, codes.InvalidArgument, "address error", errors.New("address too short")
-	}
-
-	if len(userPubKeyAddr) > 65 {
-		return nil, codes.InvalidArgument, "address error", errors.New("address too long")
-	}
-
-	u, err := dcrutil.DecodeAddress(userPubKeyAddr)
-	if err != nil {
-		return nil, codes.InvalidArgument, "address error", errors.New("couldn't decode address")
-	}
-
-	_, is := u.(*dcrutil.AddressSecpPubKey)
-	if !is {
-		return nil, codes.InvalidArgument, "address error", errors.New("incorrect address type")
+	if _, err := validateUserPubKeyAddr(userPubKeyAddr, controller.Cfg.NetParams); err != nil {
+		return nil, codes.InvalidArgument, "address error", err
 	}
 
 	// Get the ticket address for this user
@@ -278,7 +308,7 @@ func (controller *MainController) APIAddress(c web.C, r *http.Request) ([]string
 		return nil, codes.Unavailable, "system error", errors.New("unable to process wallet commands")
 	}
 
-	poolValidateAddress, err := controller.rpcServers.ValidateAddress(pooladdress)
+	poolValidateAddress, err := controller.Cfg.StakepooldServers.ValidateAddress(pooladdress)
 	if err != nil {
 		log.Errorf("unable to validate address: %v", err)
 		return nil, codes.Unavailable, "system error", errors.New("unable to process wallet commands")
@@ -291,40 +321,25 @@ func (controller *MainController) APIAddress(c web.C, r *http.Request) ([]string
 
 	poolPubKeyAddr := poolValidateAddress.PubKeyAddr
 
-	p, err := dcrutil.DecodeAddress(poolPubKeyAddr)
-	if err != nil {
-		controller.handlePotentialFatalError("DecodeAddress poolPubKeyAddr", err)
+	if _, err = dcrutil.DecodeAddress(poolPubKeyAddr, controller.Cfg.NetParams); err != nil {
 		return nil, codes.Unavailable, "system error", errors.New("unable to process wallet commands")
 	}
 
-	if controller.RPCIsStopped() {
-		return nil, codes.Unavailable, "system error", errors.New("unable to process wallet commands")
-	}
-	createMultiSig, err := controller.rpcServers.CreateMultisig(1, []dcrutil.Address{p, u})
+	createMultiSig, err := controller.Cfg.StakepooldServers.CreateMultisig([]string{poolPubKeyAddr, userPubKeyAddr})
 	if err != nil {
-		controller.handlePotentialFatalError("CreateMultisig", err)
 		return nil, codes.Unavailable, "system error", errors.New("unable to process wallet commands")
 	}
 
-	if controller.RPCIsStopped() {
-		return nil, codes.Unavailable, "system error", errors.New("unable to process wallet commands")
-	}
-	_, bestBlockHeight, err := controller.rpcServers.GetBestBlock()
-	if err != nil {
-		controller.handlePotentialFatalError("GetBestBlock", err)
-	}
-
-	if controller.RPCIsStopped() {
-		return nil, codes.Unavailable, "system error", errors.New("unable to process wallet commands")
-	}
+	// Serialize the redeem script (hex string -> []byte)
 	serializedScript, err := hex.DecodeString(createMultiSig.RedeemScript)
 	if err != nil {
-		controller.handlePotentialFatalError("CreateMultisig DecodeString", err)
 		return nil, codes.Unavailable, "system error", errors.New("unable to process wallet commands")
 	}
-	err = controller.rpcServers.ImportScript(serializedScript, int(bestBlockHeight))
+
+	// Import the redeem script
+	var importedHeight int64
+	importedHeight, err = controller.Cfg.StakepooldServers.ImportNewScript(serializedScript)
 	if err != nil {
-		controller.handlePotentialFatalError("ImportScript", err)
 		return nil, codes.Unavailable, "system error", errors.New("unable to process wallet commands")
 	}
 
@@ -336,10 +351,14 @@ func (controller *MainController) APIAddress(c web.C, r *http.Request) ([]string
 
 	models.UpdateUserByID(dbMap, user.Id, createMultiSig.Address,
 		createMultiSig.RedeemScript, poolPubKeyAddr, userPubKeyAddr,
-		userFeeAddr.EncodeAddress(), bestBlockHeight)
+		userFeeAddr.Address(), importedHeight)
 
 	log.Infof("successfully create multisigaddress for user %d", c.Env["APIUserID"])
-	controller.StakepooldUpdateAll(dbMap, StakepooldUpdateKindUsers)
+
+	err = controller.StakepooldUpdateUsers(dbMap)
+	if err != nil {
+		log.Warnf("failure to update users: %v", err)
+	}
 
 	return nil, codes.OK, "address successfully imported", nil
 }
@@ -361,7 +380,7 @@ func (controller *MainController) APIPurchaseInfo(c web.C,
 
 	purchaseInfo := &poolapi.PurchaseInfo{
 		PoolAddress:   user.UserFeeAddr,
-		PoolFees:      controller.poolFees,
+		PoolFees:      controller.Cfg.PoolFees,
 		Script:        user.MultiSigScript,
 		TicketAddress: user.MultiSigAddress,
 		VoteBits:      uint16(user.VoteBits),
@@ -377,18 +396,14 @@ func (controller *MainController) APIStats(c web.C,
 	userCount := models.GetUserCount(dbMap)
 	userCountActive := models.GetUserCountActive(dbMap)
 
-	if controller.RPCIsStopped() {
-		return nil, codes.Unavailable, "stats error", errors.New("RPC server stopped")
-	}
-
-	gsi, err := controller.rpcServers.GetStakeInfo()
+	gsi, err := controller.Cfg.StakepooldServers.GetStakeInfo()
 	if err != nil {
 		log.Infof("RPC GetStakeInfo failed: %v", err)
 		return nil, codes.Unavailable, "stats error", errors.New("RPC server error")
 	}
 
 	var poolStatus string
-	if controller.closePool {
+	if controller.Cfg.ClosePool {
 		poolStatus = "Closed"
 	} else {
 		poolStatus = "Open"
@@ -396,7 +411,7 @@ func (controller *MainController) APIStats(c web.C,
 
 	stats := &poolapi.Stats{
 		AllMempoolTix:        gsi.AllMempoolTix,
-		APIVersionsSupported: controller.APIVersionsSupported,
+		APIVersionsSupported: controller.Cfg.APIVersionsSupported,
 		BlockHeight:          gsi.BlockHeight,
 		Difficulty:           gsi.Difficulty,
 		Expired:              gsi.Expired,
@@ -410,19 +425,19 @@ func (controller *MainController) APIStats(c web.C,
 		Revoked:              gsi.Revoked,
 		TotalSubsidy:         gsi.TotalSubsidy,
 		Voted:                gsi.Voted,
-		Network:              controller.params.Name,
-		PoolEmail:            controller.poolEmail,
-		PoolFees:             controller.poolFees,
+		Network:              controller.Cfg.NetParams.Name,
+		PoolEmail:            controller.Cfg.PoolEmail,
+		PoolFees:             controller.Cfg.PoolFees,
 		PoolStatus:           poolStatus,
 		UserCount:            userCount,
 		UserCountActive:      userCountActive,
-		Version:              controller.version,
+		Version:              version.String(),
 	}
 
 	return stats, codes.OK, "stats successfully retrieved", nil
 }
 
-// APIVotingPost is the API version of VotingPost
+// APIVoting is the API version of Voting
 func (controller *MainController) APIVoting(c web.C, r *http.Request) ([]string, codes.Code, string, error) {
 	dbMap := controller.GetDbMap(c)
 
@@ -450,7 +465,9 @@ func (controller *MainController) APIVoting(c web.C, r *http.Request) ([]string,
 	}
 
 	if uint16(oldVoteBits) != userVoteBits {
-		controller.StakepooldUpdateAll(dbMap, StakepooldUpdateKindUsers)
+		if err := controller.StakepooldUpdateUsers(dbMap); err != nil {
+			log.Warnf("APIVoting: StakepooldUpdateUsers failed: %v", err)
+		}
 	}
 
 	log.Infof("updated voteBits for user %d from %d to %d",
@@ -460,8 +477,9 @@ func (controller *MainController) APIVoting(c web.C, r *http.Request) ([]string,
 }
 
 func (controller *MainController) isAdmin(c web.C, r *http.Request) (bool, error) {
-	remoteIP := getClientIP(r, controller.realIPHeader)
+	remoteIP := getClientIP(r, controller.Cfg.RealIPHeader)
 	session := controller.GetSession(c)
+	c.Env[csrf.TemplateTag] = csrf.TemplateField(r)
 
 	if session.Values["UserId"] == nil {
 		return false, fmt.Errorf("%s request with no session from %s",
@@ -470,12 +488,12 @@ func (controller *MainController) isAdmin(c web.C, r *http.Request) (bool, error
 
 	uidstr := strconv.Itoa(int(session.Values["UserId"].(int64)))
 
-	if !stringSliceContains(controller.adminIPs, remoteIP) {
+	if !stringSliceContains(controller.Cfg.AdminIPs, remoteIP) {
 		return false, fmt.Errorf("%s request from %s "+
 			"userid %s failed AdminIPs check", r.URL, remoteIP, uidstr)
 	}
 
-	if !stringSliceContains(controller.adminUserIDs, uidstr) {
+	if !stringSliceContains(controller.Cfg.AdminUserIDs, uidstr) {
 		return false, fmt.Errorf("%s request from %s "+
 			"userid %s failed adminUserIDs check", r.URL, remoteIP, uidstr)
 	}
@@ -483,137 +501,37 @@ func (controller *MainController) isAdmin(c web.C, r *http.Request) (bool, error
 	return true, nil
 }
 
-// SendMail sends an email with the passed data using the system's SMTP
-// configuration.
-func (controller *MainController) SendMail(emailaddress string, subject string, body string) error {
-
-	hostname := controller.smtpHost
-
-	if strings.Contains(controller.smtpHost, ":") {
-		parts := strings.Split(controller.smtpHost, ":")
-		hostname = parts[0]
-	}
-
-	// Set up authentication information.
-	auth := smtp.PlainAuth("", controller.smtpUsername, controller.smtpPassword, hostname)
-
-	// Connect to the server, authenticate, set the sender and recipient,
-	// and send the email all in one step.
-	to := []string{emailaddress}
-	msg := []byte("To: " + emailaddress + "\r\n" +
-		"From: " + controller.smtpFrom + "\r\n" +
-		"Subject: " + subject + "\r\n" +
-		"\r\n" +
-		body + "\r\n")
-
-	if controller.smtpHost == "" {
-		log.Warn("no mail server configured -- skipping sending " + string(msg))
-		return nil
-	}
-
-	err := smtp.SendMail(controller.smtpHost, auth, controller.smtpFrom, to, msg)
-	if err != nil {
-		log.Errorf("Error sending email to %v", err)
-	}
-	return err
-}
-
-// StakepooldGetIgnoredLowFeeTickets performs a gRPC GetIgnoredLowFeeTickets
-// request against all stakepoold instances and returns the first result fetched
-// without errors
-func (controller *MainController) StakepooldGetIgnoredLowFeeTickets() (map[chainhash.Hash]string, error) {
-	var err error
-	ignoredLowFeeTickets := make(map[chainhash.Hash]string)
-
-	// TODO need some better code here
-	for i := range controller.grpcConnections {
-		ignoredLowFeeTickets, err = stakepooldclient.StakepooldGetIgnoredLowFeeTickets(controller.grpcConnections[i])
-		// take the first non-error result
-		if err == nil {
-			return ignoredLowFeeTickets, err
-		}
-	}
-
-	return ignoredLowFeeTickets, err
-}
-
-// StakepooldUpdateAll attempts to trigger all connected stakepoold
+// StakepooldUpdateTickets attempts to trigger all connected stakepoold
 // instances to pull a data update of the specified kind.
-func (controller *MainController) StakepooldUpdateAll(dbMap *gorp.DbMap, updateKind string) error {
-	var votableLowFeeTickets []models.LowFeeTicket
-	var allUsers map[int64]*models.User
-	var err error
-
-	switch updateKind {
-	case StakepooldUpdateKindAll, StakepooldUpdateKindTickets, StakepooldUpdateKindUsers:
-		// valid
-	default:
-		return fmt.Errorf("TriggerStakepoolUpdate: unhandled update kind %v",
-			updateKind)
+func (controller *MainController) StakepooldUpdateTickets(dbMap *gorp.DbMap) error {
+	votableLowFeeTickets, err := models.GetVotableLowFeeTickets(dbMap)
+	if err != nil {
+		return err
 	}
 
-	switch updateKind {
-	case StakepooldUpdateKindAll, StakepooldUpdateKindTickets:
-		votableLowFeeTickets, err = models.GetVotableLowFeeTickets(dbMap)
-		if err != nil {
-			return err
-		}
+	err = controller.Cfg.StakepooldServers.SetAddedLowFeeTickets(votableLowFeeTickets)
+	if err != nil {
+		log.Errorf("error updating tickets on stakepoold: %v", err)
+		return err
 	}
 
-	switch updateKind {
-	case StakepooldUpdateKindAll, StakepooldUpdateKindUsers:
-		// reset votebits if Vote Version changed or if the stored VoteBits are
-		// somehow invalid
-		allUsers, err = controller.CheckAndResetUserVoteBits(dbMap)
-		if err != nil {
-			return err
-		}
+	return nil
+}
+
+// StakepooldUpdateUsers attempts to trigger all connected stakepoold
+// instances to pull a data update of the specified kind.
+func (controller *MainController) StakepooldUpdateUsers(dbMap *gorp.DbMap) error {
+	// reset votebits if Vote Version changed or if the stored VoteBits are
+	// somehow invalid
+	allUsers, err := controller.CheckAndResetUserVoteBits(dbMap)
+	if err != nil {
+		return err
 	}
 
-	successCount := 0
-	for i := range controller.grpcConnections {
-		var err error
-		var success bool
-
-		switch updateKind {
-		case StakepooldUpdateKindAll, StakepooldUpdateKindTickets:
-			success, err = stakepooldclient.StakepooldSetAddedLowFeeTickets(controller.grpcConnections[i], votableLowFeeTickets)
-			if err != nil {
-				log.Errorf("stakepoold host %d unable to update manual "+
-					"tickets grpc error: %v", i, err)
-			}
-			if !success {
-				// TODO(maybe) should re-try in the background until we get a
-				// successful update
-				log.Errorf("stakepoold host %d unable to update manual "+
-					"tickets stakepoold update would have blocked", i)
-			}
-		}
-
-		switch updateKind {
-		case StakepooldUpdateKindAll, StakepooldUpdateKindUsers:
-			success, err = stakepooldclient.StakepooldSetUserVotingPrefs(controller.grpcConnections[i], allUsers)
-			if err != nil {
-				log.Errorf("stakepoold host %d unable to update voting config "+
-					"grpc error: %v", i, err)
-			}
-			if !success {
-				// TODO(maybe) should re-try in the background until we get a
-				// successful update
-				log.Errorf("stakepoold host %d unable to update voting config "+
-					"stakepoold update would have blocked", i)
-			}
-		}
-
-		if err == nil {
-			log.Infof("successfully triggered update kind %s on stakepoold "+
-				"host %d", updateKind, i)
-			successCount++
-		}
-	}
-
-	if successCount == 0 {
-		log.Warn("no stakepoold connections alive/working?")
+	err = controller.Cfg.StakepooldServers.SetUserVotingPrefs(allUsers)
+	if err != nil {
+		log.Errorf("error updating users on stakepoold: %v", err)
+		return err
 	}
 
 	return nil
@@ -627,11 +545,11 @@ func (controller *MainController) FeeAddressForUserID(uid int) (dcrutil.Address,
 		return nil, fmt.Errorf("bad uid index %v", uid)
 	}
 
-	acctKey := controller.feeXpub
+	acctKey := controller.Cfg.FeeXpub
 	index := uint32(uid)
 
 	// Derive the appropriate branch key
-	branchKey, err := acctKey.Child(udb.ExternalBranch)
+	branchKey, err := acctKey.Child(helpers.ExternalBranch)
 	if err != nil {
 		return nil, err
 	}
@@ -641,7 +559,7 @@ func (controller *MainController) FeeAddressForUserID(uid int) (dcrutil.Address,
 		return nil, err
 	}
 
-	addr, err := key.Address(controller.params)
+	addr, err := helpers.DCRUtilAddressFromExtendedKey(key, controller.Cfg.NetParams)
 	if err != nil {
 		return nil, err
 	}
@@ -657,11 +575,11 @@ func (controller *MainController) TicketAddressForUserID(uid int) (dcrutil.Addre
 		return nil, fmt.Errorf("bad uid index %v", uid)
 	}
 
-	acctKey := controller.votingXpub
+	acctKey := controller.Cfg.VotingXpub
 	index := uint32(uid)
 
 	// Derive the appropriate branch key
-	branchKey, err := acctKey.Child(udb.ExternalBranch)
+	branchKey, err := acctKey.Child(helpers.ExternalBranch)
 	if err != nil {
 		return nil, err
 	}
@@ -671,7 +589,7 @@ func (controller *MainController) TicketAddressForUserID(uid int) (dcrutil.Addre
 		return nil, err
 	}
 
-	addr, err := key.Address(controller.params)
+	addr, err := helpers.DCRUtilAddressFromExtendedKey(key, controller.Cfg.NetParams)
 	if err != nil {
 		return nil, err
 	}
@@ -686,18 +604,8 @@ func (controller *MainController) RPCSync(dbMap *gorp.DbMap) error {
 		return err
 	}
 
-	err = walletSvrsSync(controller.rpcServers, multisigScripts)
+	err = controller.Cfg.StakepooldServers.SyncAll(multisigScripts, MaxUsers)
 	return err
-}
-
-// GetVoteVersion
-func (controller *MainController) GetVoteVersion() (uint32, error) {
-	voteVersion, err := checkWalletsVoteVersion(controller.rpcServers)
-	if err != nil {
-		return 0, err
-	}
-
-	return voteVersion, err
 }
 
 // CheckAndResetUserVoteBits reset users VoteBits if the VoteVersion has
@@ -736,20 +644,18 @@ func (controller *MainController) CheckAndResetUserVoteBits(dbMap *gorp.DbMap) (
 				log.Infof("updated VoteBits from %v to %v for uid %v",
 					oldVoteBits, defaultVoteBits, userid)
 			}
-		} else {
+		} else if !controller.IsValidVoteBits(uint16(user.VoteBits)) {
 			// Validate that the votebits are valid for the agendas of the current
 			// vote version
-			if !controller.IsValidVoteBits(uint16(user.VoteBits)) {
-				oldVoteBits := user.VoteBits
-				_, err := helpers.UpdateVoteBitsByID(dbMap, userid, defaultVoteBits)
-				if err != nil {
-					return nil, fmt.Errorf("failed to reset invalid VoteBits for uid %v: %v",
-						userid, err)
-				}
-
-				log.Infof("reset invalid VoteBits from %v to %v for uid %v",
-					oldVoteBits, defaultVoteBits, userid)
+			oldVoteBits := user.VoteBits
+			_, err := helpers.UpdateVoteBitsByID(dbMap, userid, defaultVoteBits)
+			if err != nil {
+				return nil, fmt.Errorf("failed to reset invalid VoteBits for uid %v: %v",
+					userid, err)
 			}
+
+			log.Infof("reset invalid VoteBits from %v to %v for uid %v",
+				oldVoteBits, defaultVoteBits, userid)
 		}
 	}
 
@@ -767,42 +673,12 @@ func (controller *MainController) CheckAndResetUserVoteBits(dbMap *gorp.DbMap) (
 	return allUsers, nil
 }
 
-// RPCStart starts the connected rpcServers.
-func (controller *MainController) RPCStart() {
-	controller.rpcServers.Start()
-}
-
-// RPCStop stops the connected rpcServers.
-func (controller *MainController) RPCStop() error {
-	return controller.rpcServers.Stop()
-}
-
-// RPCIsStopped checks to see if w.shutdown is set or not.
-func (controller *MainController) RPCIsStopped() bool {
-	return controller.rpcServers.IsStopped()
-}
-
-// WalletStatus returns current WalletInfo from all rpcServers.
-func (controller *MainController) WalletStatus() ([]*dcrjson.WalletInfoResult, error) {
-	return controller.rpcServers.WalletStatus()
-}
-
-// handlePotentialFatalError is a helper function to do log possibly
-// fatal rpc errors and also stops the servers to avoid any potential
-// further damage.
-func (controller *MainController) handlePotentialFatalError(fn string, err error) {
-	cnErr, ok := err.(connectionError)
-	if ok {
-		log.Infof("RPC %s failed on connection error: %v", fn, cnErr)
-	}
-	controller.RPCStop()
-	log.Infof("RPC %s failed: %v", fn, err)
-}
-
 // Address renders the address page.
 func (controller *MainController) Address(c web.C, r *http.Request) (string, int) {
 	t := controller.GetTemplate(c)
 	session := controller.GetSession(c)
+	c.Env[csrf.TemplateTag] = csrf.TemplateField(r)
+	dbMap := controller.GetDbMap(c)
 
 	if session.Values["UserId"] == nil {
 		return "/", http.StatusSeeOther
@@ -810,21 +686,71 @@ func (controller *MainController) Address(c web.C, r *http.Request) (string, int
 
 	c.Env["Admin"], _ = controller.isAdmin(c, r)
 	c.Env["IsAddress"] = true
+	c.Env["PoolFees"] = controller.Cfg.PoolFees
 	c.Env["Network"] = controller.getNetworkName()
 
 	c.Env["Flash"] = session.Flashes("address")
+	user, _ := models.GetUserById(dbMap, session.Values["UserId"].(int64))
+
+	// Generate an API Token for the user on demand if one does not exist and
+	// refresh the user's data before displaying it.
+	if user.APIToken == "" {
+		token, err := models.SetUserAPIToken(dbMap, controller.Cfg.APISecret,
+			controller.Cfg.BaseURL, user.Id)
+		if err != nil {
+			session.AddFlash("Unable to set API Token", "settingsError")
+			log.Errorf("could not set API Token for UserId %v", user.Id)
+		}
+
+		c.Env["APIToken"] = token
+	} else {
+		c.Env["APIToken"] = user.APIToken
+	}
+
 	widgets := controller.Parse(t, "address", c.Env)
 
-	c.Env["Title"] = "Decred Stake Pool - Address"
+	c.Env["Title"] = "Decred VSP - Address"
+	c.Env["Designation"] = controller.Cfg.Designation
+
 	c.Env["Content"] = template.HTML(widgets)
 
 	return controller.Parse(t, "main", c.Env), http.StatusOK
 }
 
+func validateUserPubKeyAddr(pubKeyAddr string, params *chaincfg.Params) (dcrutil.Address, error) {
+	if len(pubKeyAddr) < 40 {
+		str := "Address is too short"
+		log.Warnf("User submitted invalid address: %s - %s", pubKeyAddr, str)
+		return nil, errors.New(str)
+	}
+
+	if len(pubKeyAddr) > 65 {
+		str := "Address is too long"
+		log.Warnf("User submitted invalid address: %s - %s", pubKeyAddr, str)
+		return nil, errors.New(str)
+	}
+
+	u, err := dcrutil.DecodeAddress(pubKeyAddr, params)
+	if err != nil {
+		log.Warnf("User submitted invalid address: %s - %v", pubKeyAddr, err)
+		return nil, errors.New("Couldn't decode address")
+	}
+
+	_, is := u.(*dcrutil.AddressSecpPubKey)
+	if !is {
+		str := "Incorrect address type"
+		log.Warnf("User submitted invalid address: %s - %s", pubKeyAddr, str)
+		return nil, errors.New(str)
+	}
+
+	return u, nil
+}
+
 // AddressPost is address form submit route.
 func (controller *MainController) AddressPost(c web.C, r *http.Request) (string, int) {
 	session := controller.GetSession(c)
-	remoteIP := getClientIP(r, controller.realIPHeader)
+	c.Env[csrf.TemplateTag] = csrf.TemplateField(r)
+	remoteIP := getClientIP(r, controller.Cfg.RealIPHeader)
 
 	if session.Values["UserId"] == nil {
 		return "/", http.StatusSeeOther
@@ -835,7 +761,7 @@ func (controller *MainController) AddressPost(c web.C, r *http.Request) (string,
 	dbMap := controller.GetDbMap(c)
 	user, _ := models.GetUserById(dbMap, session.Values["UserId"].(int64))
 	if len(user.UserPubKeyAddr) > 0 {
-		session.AddFlash("Stake pool is currently limited to one address per account", "address")
+		session.AddFlash("The voting service is currently limited to one address per account", "address")
 		return controller.Address(c, r)
 	}
 
@@ -843,26 +769,8 @@ func (controller *MainController) AddressPost(c web.C, r *http.Request) (string,
 
 	log.Infof("Address POST from %v, pubkeyaddr %v", remoteIP, userPubKeyAddr)
 
-	if len(userPubKeyAddr) < 40 {
-		session.AddFlash("Address is too short", "address")
-		return controller.Address(c, r)
-	}
-
-	if len(userPubKeyAddr) > 65 {
-		session.AddFlash("Address is too long", "address")
-		return controller.Address(c, r)
-	}
-
-	// Get dcrutil.Address for user from pubkey address string
-	u, err := dcrutil.DecodeAddress(userPubKeyAddr)
-	if err != nil {
-		session.AddFlash("Couldn't decode address", "address")
-		return controller.Address(c, r)
-	}
-
-	_, is := u.(*dcrutil.AddressSecpPubKey)
-	if !is {
-		session.AddFlash("Incorrect address type", "address")
+	if _, err := validateUserPubKeyAddr(userPubKeyAddr, controller.Cfg.NetParams); err != nil {
+		session.AddFlash(err.Error(), "address")
 		return controller.Address(c, r)
 	}
 
@@ -875,12 +783,8 @@ func (controller *MainController) AddressPost(c web.C, r *http.Request) (string,
 	}
 
 	// From new address (pkh), get pubkey address
-	if controller.RPCIsStopped() {
-		return "/error", http.StatusSeeOther
-	}
-	poolValidateAddress, err := controller.rpcServers.ValidateAddress(pooladdress)
+	poolValidateAddress, err := controller.Cfg.StakepooldServers.ValidateAddress(pooladdress)
 	if err != nil {
-		controller.handlePotentialFatalError("ValidateAddress pooladdress", err)
 		return "/error", http.StatusSeeOther
 	}
 	if !poolValidateAddress.IsMine {
@@ -892,44 +796,26 @@ func (controller *MainController) AddressPost(c web.C, r *http.Request) (string,
 	poolPubKeyAddr := poolValidateAddress.PubKeyAddr
 
 	// Get back Address from pool's new pubkey address
-	p, err := dcrutil.DecodeAddress(poolPubKeyAddr)
-	if err != nil {
-		controller.handlePotentialFatalError("DecodeAddress poolPubKeyAddr", err)
+	if _, err = dcrutil.DecodeAddress(poolPubKeyAddr, controller.Cfg.NetParams); err != nil {
 		return "/error", http.StatusSeeOther
 	}
 
-	// Create the the multisig script. Result includes a P2SH and RedeemScript.
-	if controller.RPCIsStopped() {
-		return "/error", http.StatusSeeOther
-	}
-	createMultiSig, err := controller.rpcServers.CreateMultisig(1, []dcrutil.Address{p, u})
+	// Create the the multisig script. Result includes a P2SH and redeem script.
+	createMultiSig, err := controller.Cfg.StakepooldServers.CreateMultisig([]string{poolPubKeyAddr, userPubKeyAddr})
 	if err != nil {
-		controller.handlePotentialFatalError("CreateMultisig", err)
 		return "/error", http.StatusSeeOther
 	}
 
-	// Serialize the RedeemScript (hex string -> []byte)
-	if controller.RPCIsStopped() {
-		return "/error", http.StatusSeeOther
-	}
-	_, bestBlockHeight, err := controller.rpcServers.GetBestBlock()
-	if err != nil {
-		controller.handlePotentialFatalError("GetBestBlock", err)
-	}
-
-	if controller.RPCIsStopped() {
-		return "/error", http.StatusSeeOther
-	}
+	// Serialize the redeem script (hex string -> []byte)
 	serializedScript, err := hex.DecodeString(createMultiSig.RedeemScript)
 	if err != nil {
-		controller.handlePotentialFatalError("CreateMultisig DecodeString", err)
 		return "/error", http.StatusSeeOther
 	}
 
-	// Import the RedeemScript
-	err = controller.rpcServers.ImportScript(serializedScript, int(bestBlockHeight))
+	// Import the redeem script
+	var importedHeight int64
+	importedHeight, err = controller.Cfg.StakepooldServers.ImportNewScript(serializedScript)
 	if err != nil {
-		controller.handlePotentialFatalError("ImportScript", err)
 		return "/error", http.StatusSeeOther
 	}
 
@@ -945,9 +831,11 @@ func (controller *MainController) AddressPost(c web.C, r *http.Request) (string,
 	// addresses, and the fee address
 	models.UpdateUserByID(dbMap, uid64, createMultiSig.Address,
 		createMultiSig.RedeemScript, poolPubKeyAddr, userPubKeyAddr,
-		userFeeAddr.EncodeAddress(), bestBlockHeight)
+		userFeeAddr.Address(), importedHeight)
 
-	controller.StakepooldUpdateAll(dbMap, StakepooldUpdateKindUsers)
+	if err = controller.StakepooldUpdateUsers(dbMap); err != nil {
+		log.Errorf("unable to update all: %v", err)
+	}
 
 	return "/tickets", http.StatusSeeOther
 }
@@ -960,110 +848,31 @@ func (controller *MainController) AdminStatus(c web.C, r *http.Request) (string,
 		return "", http.StatusUnauthorized
 	}
 
-	type stakepooldInfoPage struct {
-		Status string
-	}
-
-	stakepooldPageInfo := make([]stakepooldInfoPage, len(controller.grpcConnections))
-
-	for i, conn := range controller.grpcConnections {
-		grpcStatus := "Unknown"
-		state := conn.GetState()
-		switch state {
-		case connectivity.Idle:
-			grpcStatus = "Idle"
-		case connectivity.Shutdown:
-			grpcStatus = "Shutdown"
-		case connectivity.Ready:
-			grpcStatus = "Ready"
-		case connectivity.Connecting:
-			grpcStatus = "Connecting"
-		case connectivity.TransientFailure:
-			grpcStatus = "TransientFailure"
-		}
-		stakepooldPageInfo[i] = stakepooldInfoPage{
-			Status: grpcStatus,
-		}
-	}
-
-	// Attempt to query wallet statuses
-	walletInfo, err := controller.WalletStatus()
-	if err != nil {
-		// decide when to throw err here
-	}
-
-	type WalletInfoPage struct {
-		Connected       bool
-		DaemonConnected bool
-		Unlocked        bool
-		EnableVoting    bool
-	}
-	walletPageInfo := make([]WalletInfoPage, len(walletInfo))
-	connectedWallets := 0
-	for i, v := range walletInfo {
-		// If something is nil in the slice means it is disconnected.
-		if v == nil {
-			walletPageInfo[i] = WalletInfoPage{
-				Connected: false,
-			}
-			controller.rpcServers.DisconnectWalletRPC(i)
-			err = controller.rpcServers.ReconnectWalletRPC(i)
-			if err != nil {
-				log.Infof("wallet rpc reconnect failed: server %v %v", i, err)
-			}
-			continue
-		}
-		// Wallet has been successfully queried.
-		connectedWallets++
-		walletPageInfo[i] = WalletInfoPage{
-			Connected:       true,
-			DaemonConnected: v.DaemonConnected,
-			EnableVoting:    v.Voting,
-			Unlocked:        v.Unlocked,
-		}
-	}
-
-	// Depending on how many wallets have been detected update RPCStatus.
-	// Admins can then use to monitor this page periodically and check status.
-	var rpcstatus string
-	allWallets := len(walletInfo)
-
-	if connectedWallets == allWallets {
-		rpcstatus = "OK"
-	} else {
-		if connectedWallets == 0 {
-			rpcstatus = "Emergency"
-		} else if connectedWallets == 1 {
-			rpcstatus = "Critical"
-		} else {
-			rpcstatus = "Degraded"
-		}
-	}
+	backendStatus := controller.Cfg.StakepooldServers.BackendStatus()
 
 	t := controller.GetTemplate(c)
 	c.Env["Admin"] = isAdmin
 	c.Env["IsAdminStatus"] = true
-	c.Env["Title"] = "Decred Stake Pool - Status (Admin)"
+	c.Env["Title"] = "Decred Voting Service - Status (Admin)"
 
 	// Set info to be used by admins on /status page.
-	c.Env["StakepooldInfo"] = stakepooldPageInfo
-	c.Env["WalletInfo"] = walletPageInfo
-	c.Env["RPCStatus"] = rpcstatus
+	c.Env["BackendStatus"] = backendStatus
 
 	widgets := controller.Parse(t, "admin/status", c.Env)
-	c.Env["Content"] = template.HTML(widgets)
+	c.Env["Designation"] = controller.Cfg.Designation
 
-	if controller.RPCIsStopped() {
-		return controller.Parse(t, "main", c.Env), http.StatusInternalServerError
-	}
+	c.Env["Content"] = template.HTML(widgets)
 
 	return controller.Parse(t, "main", c.Env), http.StatusOK
 }
 
 // AdminTickets renders the administrative tickets page.
+// Tickets purchased with an incorrect VSP fee will be listed on this page.
+// Admin users can choose whether the pool should vote these tickets or not.
 func (controller *MainController) AdminTickets(c web.C, r *http.Request) (string, int) {
 	t := controller.GetTemplate(c)
 	session := controller.GetSession(c)
+	c.Env[csrf.TemplateTag] = csrf.TemplateField(r)
 	dbMap := controller.GetDbMap(c)
 
 	isAdmin, err := controller.isAdmin(c, r)
@@ -1081,18 +890,27 @@ func (controller *MainController) AdminTickets(c web.C, r *http.Request) (string
 		}
 	}
 
+	ignoredLowFeeTickets, err := controller.Cfg.StakepooldServers.GetIgnoredLowFeeTickets()
+	if err != nil {
+		log.Errorf("Could not retrieve ignored low fee tickets from stakepoold: %v", err)
+		session.AddFlash("Could not retrieve ignored low fee tickets from stakepoold", "adminTicketsError")
+	}
+
 	c.Env["Admin"] = isAdmin
 	c.Env["IsAdminTickets"] = true
-	c.Env["Network"] = controller.getNetworkName()
+	c.Env["DCRDataURL"] = controller.DCRDataURL
 
 	c.Env["FlashError"] = session.Flashes("adminTicketsError")
 	c.Env["FlashSuccess"] = session.Flashes("adminTicketsSuccess")
 
 	c.Env["AddedLowFeeTickets"] = votableLowFeeTickets
-	c.Env["IgnoredLowFeeTickets"], _ = controller.StakepooldGetIgnoredLowFeeTickets()
+	c.Env["IgnoredLowFeeTickets"] = ignoredLowFeeTickets
+
 	widgets := controller.Parse(t, "admin/tickets", c.Env)
 
-	c.Env["Title"] = "Decred Stake Pool - Tickets (Admin)"
+	c.Env["Title"] = "Decred Voting Service - Tickets (Admin)"
+	c.Env["Designation"] = controller.Cfg.Designation
+
 	c.Env["Content"] = template.HTML(widgets)
 
 	return controller.Parse(t, "main", c.Env), http.StatusOK
@@ -1101,8 +919,15 @@ func (controller *MainController) AdminTickets(c web.C, r *http.Request) (string
 // AdminTicketsPost validates and processes the form posted from AdminTickets.
 func (controller *MainController) AdminTicketsPost(c web.C, r *http.Request) (string, int) {
 	session := controller.GetSession(c)
+	c.Env[csrf.TemplateTag] = csrf.TemplateField(r)
 	dbMap := controller.GetDbMap(c)
-	remoteIP := getClientIP(r, controller.realIPHeader)
+	remoteIP := getClientIP(r, controller.Cfg.RealIPHeader)
+
+	userID, ok := session.Values["UserId"].(int64)
+	if !ok {
+		log.Warnf("UserId not set!")
+		return "", http.StatusUnauthorized
+	}
 
 	isAdmin, err := controller.isAdmin(c, r)
 	if !isAdmin {
@@ -1116,87 +941,101 @@ func (controller *MainController) AdminTicketsPost(c web.C, r *http.Request) (st
 		return "/admintickets", http.StatusSeeOther
 	}
 
-	if len(r.PostForm["tickets[]"]) == 0 {
+	ticketList := r.PostForm["tickets[]"]
+
+	if len(ticketList) == 0 {
 		session.AddFlash("no tickets selected to modify", "adminTicketsError")
 		return "/admintickets", http.StatusSeeOther
 	}
 
-	switch r.PostFormValue("action") {
-	case "Add", "Remove":
-		// valid
-		break
+	// Validate each of the ticket hash strings.
+	ticketHashes, err := models.DecodeHashList(ticketList)
+	if err != nil {
+		session.AddFlash("Invalid ticket in form data: "+err.Error(),
+			"adminTicketsError")
+		return "/admintickets", http.StatusSeeOther
+	}
+
+	action := strings.ToLower(r.PostFormValue("action"))
+	switch action {
+	case "add", "remove":
+		// recognized action
 	default:
 		session.AddFlash("invalid or unknown form action type", "adminTicketsError")
 		return "/admintickets", http.StatusSeeOther
 	}
 
-	actionVerb := "Unknown"
-	switch r.PostFormValue("action") {
-	case "Add":
+	actionVerb := "unknown"
+	switch action {
+	case "add":
 		actionVerb = "added"
-		ignoredLowFeeTickets, err := controller.StakepooldGetIgnoredLowFeeTickets()
+		ignoredLowFeeTickets, err := controller.Cfg.StakepooldServers.GetIgnoredLowFeeTickets()
 		if err != nil {
-			session.AddFlash("GetIgnoredLowFeeTickets error: "+err.Error(), "adminTicketsError")
+			session.AddFlash("GetIgnoredLowFeeTickets error: "+err.Error(),
+				"adminTicketsError")
 			return "/admintickets", http.StatusSeeOther
 		}
 
-		for _, ticketToAddString := range r.PostForm["tickets[]"] {
-			t := time.Now()
+		for i, tickethash := range ticketHashes {
+			t := ticketList[i]
 
 			// TODO check if it is already present in the database
 			// and error out if so
 
-			tickethash, err := chainhash.NewHashFromStr(ticketToAddString)
-			if err != nil {
-				session.AddFlash("NewHashFromStr failed for "+ticketToAddString+": "+err.Error(), "adminTicketsError")
-				return "/admintickets", http.StatusSeeOther
-			}
-
-			msa, exists := ignoredLowFeeTickets[*tickethash]
+			msa, exists := ignoredLowFeeTickets[tickethash]
 			if !exists {
-				session.AddFlash("ticket " + ticketToAddString + " is no longer present")
+				session.AddFlash("ticket " + t + " is no longer present")
 				return "/admintickets", http.StatusSeeOther
 			}
 
 			expires := controller.CalcEstimatedTicketExpiry()
 
 			lowFeeTicket := &models.LowFeeTicket{
-				AddedByUid:    session.Values["UserId"].(int64),
+				AddedByUid:    userID,
 				TicketAddress: msa,
-				TicketHash:    ticketToAddString,
+				TicketHash:    t,
 				TicketExpiry:  0,
 				Voted:         0,
-				Created:       t.Unix(),
+				Created:       time.Now().Unix(),
 				Expires:       expires.Unix(),
 			}
 
-			if err := models.InsertLowFeeTicket(dbMap, lowFeeTicket); err != nil {
-				session.AddFlash("Database error occurred while adding ticket "+ticketToAddString, "adminTicketsError")
+			err = models.InsertLowFeeTicket(dbMap, lowFeeTicket)
+			if err != nil {
+				session.AddFlash("Database error occurred while adding ticket "+
+					t, "adminTicketsError")
 				log.Warnf("Adding ticket %v failed: %v", tickethash, err)
 				return "/admintickets", http.StatusSeeOther
 			}
 		}
-	case "Remove":
+
+	case "remove":
 		actionVerb = "removed"
-		query := "DELETE FROM LowFeeTicket WHERE TicketHash IN (\"" +
-			strings.Join(r.PostForm["tickets[]"], ",") + "\")"
-		_, err := dbMap.Exec(query)
+		// To use gorm's slice expansion, use a mapper with a ticketList. For
+		// three tickets in the list, gorm will expand this to:
+		//     "... IN (:Tickets0,:Tickets1,:Tickets2)".
+		// This allows each string in the list two be it's own argument.
+		query := "DELETE FROM LowFeeTicket WHERE TicketHash IN (:Tickets)"
+		ticketListMapper := map[string]interface{}{
+			"Tickets": ticketList,
+		}
+		_, err := dbMap.Exec(query, ticketListMapper)
 		if err != nil {
-			session.AddFlash("failed to execute delete query: "+err.Error(), "adminTicketsError")
+			session.AddFlash("failed to execute delete query: "+err.Error(),
+				"adminTicketsError")
 			return "/admintickets", http.StatusSeeOther
 		}
 	}
 
-	err = controller.StakepooldUpdateAll(dbMap, StakepooldUpdateKindTickets)
+	err = controller.StakepooldUpdateTickets(dbMap)
 	if err != nil {
 		session.AddFlash("StakepooldUpdateAll error: "+err.Error(), "adminTicketsError")
 	}
 
-	log.Infof("ip %v userid %v %v for %v ticket(s)",
-		remoteIP, session.Values["UserId"].(int64), actionVerb,
-		len(r.PostForm["tickets[]"]))
-	session.AddFlash("successfully "+actionVerb+" "+
-		strconv.Itoa(len(r.PostForm["tickets[]"]))+" ticket(s)", "adminTicketsSuccess")
+	log.Infof("ip %s userid %d %s for %d ticket(s)", remoteIP, userID,
+		actionVerb, len(ticketList))
+	session.AddFlash(fmt.Sprintf("Successfully %s %d ticket(s)", actionVerb,
+		len(ticketList)), "adminTicketsSuccess")
 
 	return "/admintickets", http.StatusSeeOther
 }
@@ -1205,128 +1044,150 @@ func (controller *MainController) AdminTicketsPost(c web.C, r *http.Request) (st
 func (controller *MainController) EmailUpdate(c web.C, r *http.Request) (string, int) {
 	t := controller.GetTemplate(c)
 	session := controller.GetSession(c)
+	c.Env[csrf.TemplateTag] = csrf.TemplateField(r)
 	dbMap := controller.GetDbMap(c)
 
-	// validate that the token is set, valid, and not expired.
-	token := r.URL.Query().Get("t")
+	render := func() string {
+		c.Env["Title"] = "Decred Voting Service - Email Update"
+		c.Env["FlashError"] = session.Flashes("emailupdateError")
+		c.Env["FlashSuccess"] = session.Flashes("emailupdateSuccess")
+		c.Env["IsEmailUpdate"] = true
+		widgets := controller.Parse(t, "emailupdate", c.Env)
+		c.Env["Designation"] = controller.Cfg.Designation
 
-	if token != "" {
-		failed := false
-		emailChange, err := helpers.EmailChangeTokenExists(dbMap, token)
-		if err != nil {
-			session.AddFlash("Email verification token not valid",
-				"emailupdateError")
-			failed = true
-		}
-
-		if !failed {
-			if emailChange.Expires-time.Now().Unix() <= 0 {
-				session.AddFlash("Email change token has expired",
-					"emailupdateError")
-				failed = true
-			}
-		}
-
-		// possible that someone signed up with this email in the time between
-		// when the token was generated and now.
-		if !failed {
-			userExists := models.GetUserByEmail(dbMap, emailChange.NewEmail)
-			if userExists != nil {
-				session.AddFlash("Email address is in use", "emailupdateError")
-				failed = true
-			}
-		}
-
-		if !failed {
-			err := helpers.EmailChangeComplete(dbMap, token)
-			if err != nil {
-				session.AddFlash("Error occurred while changing email address",
-					"emailupdateError")
-				log.Errorf("EmailChangeComplete failed %v", err)
-			} else {
-				// Logout the user to force them to sign in with their new
-				// email address
-				session.Values["UserId"] = nil
-				session.AddFlash("Email successfully updated",
-					"emailupdateSuccess")
-			}
-		}
-	} else {
-		session.AddFlash("No email verification token present",
-			"emailupdateError")
+		c.Env["Content"] = template.HTML(widgets)
+		return controller.Parse(t, "main", c.Env)
 	}
 
-	c.Env["FlashError"] = session.Flashes("emailupdateError")
-	c.Env["FlashSuccess"] = session.Flashes("emailupdateSuccess")
+	// Validate that the token is set.
+	tokenStr := r.URL.Query().Get("t")
+	if tokenStr == "" {
+		session.AddFlash("No email verification token present",
+			"emailupdateError")
+		return render(), http.StatusOK
+	}
 
-	widgets := controller.Parse(t, "emailupdate", c.Env)
-	c.Env["IsEmailUpdate"] = true
-	c.Env["Title"] = "Decred Stake Pool - Email Update"
-	c.Env["Content"] = template.HTML(widgets)
+	// Validate that the token is valid.
+	token, err := models.UserTokenFromStr(tokenStr)
+	if err != nil {
+		session.AddFlash("Email verification token not valid.",
+			"emailupdateError")
+		return render(), http.StatusOK
+	}
 
-	return controller.Parse(t, "main", c.Env), http.StatusOK
+	// Validate that the token is recognized.
+	emailChange, err := helpers.EmailChangeTokenExists(dbMap, token)
+	if err != nil {
+		session.AddFlash("Email verification token not recognized.",
+			"emailupdateError")
+		return render(), http.StatusOK
+	}
+
+	// Validate that the token is not expired.
+	expTime := time.Unix(emailChange.Expires, 0)
+	if expTime.Before(time.Now()) {
+		session.AddFlash("Email change token has expired.",
+			"emailupdateError")
+		return render(), http.StatusOK
+	}
+
+	// possible that someone signed up with this email in the time between
+	// when the token was generated and now.
+	userExists := models.GetUserByEmail(dbMap, emailChange.NewEmail)
+	if userExists != nil {
+		session.AddFlash("Email address is in use", "emailupdateError")
+		return render(), http.StatusOK
+	}
+
+	err = helpers.EmailChangeComplete(dbMap, token)
+	if err != nil {
+		session.AddFlash("Error occurred while changing email address",
+			"emailupdateError")
+		log.Errorf("EmailUpdate: EmailChangeComplete failed %v", err)
+	} else {
+		// destroy session data and force re-login
+		userID, _ := session.Values["UserId"].(int64)
+		session.Options.MaxAge = -1
+		if err := system.DestroySessionsForUserID(dbMap, userID); err != nil {
+			log.Warnf("EmailUpdate: DestroySessionsForUserID '%v' failed: %v",
+				userID, err)
+		}
+
+		session.AddFlash("Email successfully updated",
+			"emailupdateSuccess")
+	}
+	return render(), http.StatusOK
 }
 
 // EmailVerify renders the email verification page.
-func (controller *MainController) EmailVerify(c web.C, r *http.Request) (string,
-	int) {
+func (controller *MainController) EmailVerify(c web.C, r *http.Request) (string, int) {
 	t := controller.GetTemplate(c)
 	session := controller.GetSession(c)
+	c.Env[csrf.TemplateTag] = csrf.TemplateField(r)
 	dbMap := controller.GetDbMap(c)
 
-	// validate that the token is set and valid.
-	token := r.URL.Query().Get("t")
+	render := func() string {
+		c.Env["Title"] = "Decred Voting Service - Email Verification"
+		c.Env["FlashError"] = session.Flashes("emailverifyError")
+		c.Env["FlashSuccess"] = session.Flashes("emailverifySuccess")
+		c.Env["IsEmailVerify"] = true
+		widgets := controller.Parse(t, "emailverify", c.Env)
+		c.Env["Designation"] = controller.Cfg.Designation
 
-	if token != "" {
-		_, err := helpers.EmailVerificationTokenExists(dbMap, token)
-		if err != nil {
-			session.AddFlash("Email verification token not valid",
-				"emailverifyError")
-		} else {
-			err := helpers.EmailVerificationComplete(dbMap, token)
-			if err != nil {
-				session.AddFlash("Unable to set email to verified status",
-					"emailverifyError")
-				log.Errorf("could not set email to verified %v", err)
-			} else {
-				session.AddFlash("Email successfully verified",
-					"emailverifySuccess")
-			}
-		}
-	} else {
-		session.AddFlash("No email verification token present",
-			"emailverifyError")
+		c.Env["Content"] = template.HTML(widgets)
+		return controller.Parse(t, "main", c.Env)
 	}
 
-	c.Env["FlashError"] = session.Flashes("emailverifyError")
-	c.Env["FlashSuccess"] = session.Flashes("emailverifySuccess")
+	// Validate that the token is set.
+	tokenStr := r.URL.Query().Get("t")
+	if tokenStr == "" {
+		session.AddFlash("No email verification token present.",
+			"emailverifyError")
+		return render(), http.StatusOK
+	}
 
-	widgets := controller.Parse(t, "emailverify", c.Env)
-	c.Env["IsEmailVerify"] = true
-	c.Env["Title"] = "Decred Stake Pool - Email Verification"
-	c.Env["Content"] = template.HTML(widgets)
+	// Validate that the token is valid.
+	token, err := models.UserTokenFromStr(tokenStr)
+	if err != nil {
+		session.AddFlash("Email verification token not valid.",
+			"emailverifyError")
+		return render(), http.StatusOK
+	}
 
-	return controller.Parse(t, "main", c.Env), http.StatusOK
+	// Validate that the token is recognized.
+	_, err = helpers.EmailVerificationTokenExists(dbMap, token)
+	if err != nil {
+		session.AddFlash("Email verification token not recognized.",
+			"emailverifyError")
+		return render(), http.StatusOK
+	}
+
+	// Set the email as verified.
+	err = helpers.EmailVerificationComplete(dbMap, token)
+	if err != nil {
+		session.AddFlash("Unable to set email to verified status.",
+			"emailverifyError")
+		log.Errorf("could not set email to verified %v", err)
+		return render(), http.StatusInternalServerError
+	}
+
+	session.AddFlash("Email successfully verified.",
+		"emailverifySuccess")
+	return render(), http.StatusOK
 }
 
 // Error renders the error page.
 func (controller *MainController) Error(c web.C, r *http.Request) (string, int) {
 	t := controller.GetTemplate(c)
 
-	var rpcstatus = "Running"
-
-	if controller.RPCIsStopped() {
-		rpcstatus = "Stopped"
-	}
-
 	c.Env["Admin"], _ = controller.isAdmin(c, r)
 	c.Env["IsError"] = true
-	c.Env["Title"] = "Decred Stake Pool - Error"
-	c.Env["RPCStatus"] = rpcstatus
+	c.Env["Title"] = "Decred VSP - Error"
 	c.Env["RateLimited"] = r.URL.Query().Get("rl")
-	c.Env["Referer"] = r.URL.Query().Get("r")
 
 	widgets := controller.Parse(t, "error", c.Env)
+	c.Env["Designation"] = controller.Cfg.Designation
+
 	c.Env["Content"] = template.HTML(widgets)
 
 	return controller.Parse(t, "main", c.Env), http.StatusOK
@@ -1334,65 +1195,89 @@ func (controller *MainController) Error(c web.C, r *http.Request) (string, int) 
 
 // Index renders the home page.
 func (controller *MainController) Index(c web.C, r *http.Request) (string, int) {
-	if controller.closePool {
+	if controller.Cfg.ClosePool {
 		c.Env["IsClosed"] = true
-		c.Env["ClosePoolMsg"] = controller.closePoolMsg
+		c.Env["ClosePoolMsg"] = controller.Cfg.ClosePoolMsg
 	}
-	c.Env["Network"] = controller.params.Name
-	c.Env["PoolEmail"] = controller.poolEmail
-	c.Env["PoolFees"] = controller.poolFees
-	c.Env["PoolLink"] = controller.poolLink
+	c.Env["Network"] = controller.Cfg.NetParams.Name
+	c.Env["PoolEmail"] = controller.Cfg.PoolEmail
+	c.Env["PoolFees"] = controller.Cfg.PoolFees
+	c.Env["CustomDescription"] = controller.Cfg.Description
+	c.Env["PoolLink"] = controller.Cfg.PoolLink
+
+	gsi, err := controller.Cfg.StakepooldServers.GetStakeInfo()
+	if err != nil {
+		log.Errorf("RPC GetStakeInfo failed: %v", err)
+		return "/error", http.StatusSeeOther
+	}
+
+	c.Env["StakeInfo"] = gsi
+	c.Env["LivePercent"] = gsi.ProportionLive * 100
 
 	t := controller.GetTemplate(c)
 
 	// execute the named template with data in c.Env
-	widgets := helpers.Parse(t, "home", c.Env)
-
+	widgets, err := helpers.Parse(t, "home", c.Env)
+	if err != nil {
+		log.Errorf("helpers.Parse: home failed: %v", err)
+		return "/error", http.StatusSeeOther
+	}
 	c.Env["Admin"], _ = controller.isAdmin(c, r)
 	c.Env["IsIndex"] = true
-	c.Env["Title"] = "Decred Stake Pool - Welcome"
+	c.Env["Title"] = "Decred Voting Service - Welcome"
+	c.Env["Designation"] = controller.Cfg.Designation
+
 	c.Env["Content"] = template.HTML(widgets)
 
-	return helpers.Parse(t, "main", c.Env), http.StatusOK
+	doc, err := helpers.Parse(t, "main", c.Env)
+	if err != nil {
+		log.Errorf("helpers.Parse: main failed: %v", err)
+		return "/error", http.StatusSeeOther
+	}
+	return doc, http.StatusOK
 }
 
-// PasswordReset renders the password reset page.
+// PasswordReset renders the password reset page. This shows the form where the
+// user enters their email address.
 func (controller *MainController) PasswordReset(c web.C, r *http.Request) (string, int) {
-	t := controller.GetTemplate(c)
+	c.Env["Title"] = "Decred Voting Service - Password Reset"
 	session := controller.GetSession(c)
+	c.Env[csrf.TemplateTag] = csrf.TemplateField(r)
 	c.Env["FlashError"] = session.Flashes("passwordresetError")
 	c.Env["FlashSuccess"] = session.Flashes("passwordresetSuccess")
 	c.Env["IsPasswordReset"] = true
-	c.Env["RecaptchaSiteKey"] = controller.recaptchaSiteKey
-	if controller.smtpHost == "" {
-		c.Env["SMTPDisabled"] = true
-	}
+	c.Env["CaptchaID"] = captcha.New()
+	c.Env["CaptchaMsg"] = "To reset your password, first complete the captcha:"
+	c.Env["CaptchaError"] = session.Flashes("captchaFailed")
 
+	t := controller.GetTemplate(c)
 	widgets := controller.Parse(t, "passwordreset", c.Env)
-	c.Env["Title"] = "Decred Stake Pool - Password Reset"
+	c.Env["Designation"] = controller.Cfg.Designation
+
 	c.Env["Content"] = template.HTML(widgets)
 
 	return controller.Parse(t, "main", c.Env), http.StatusOK
 }
 
-// PasswordResetPost handles the posted password reset form.
+// PasswordResetPost handles the posted password reset form. This submits the
+// data entered into the email address form. If the email is recognized a
+// password reset token is generated and the user will check their email for a
+// link. The link will take them to the password update page with a token
+// specified on the URL.
 func (controller *MainController) PasswordResetPost(c web.C, r *http.Request) (string, int) {
 	email := r.FormValue("email")
 	session := controller.GetSession(c)
+	c.Env[csrf.TemplateTag] = csrf.TemplateField(r)
 	dbMap := controller.GetDbMap(c)
 
-	re := recaptcha.R{
-		Secret: controller.recaptchaSecret,
-	}
-
-	isValid := re.Verify(*r)
-	if !isValid {
-		log.Errorf("Recaptcha error %v", re.LastError())
-		session.AddFlash("Recaptcha error", "passwordresetError")
+	if !controller.IsCaptchaDone(c) {
+		session.AddFlash("You must complete the captcha.", "passwordresetError")
 		return controller.PasswordReset(c, r)
 	}
+	session.Values["CaptchaDone"] = false
+	c.Env["CaptchaDone"] = false
 
-	remoteIP := getClientIP(r, controller.realIPHeader)
+	remoteIP := getClientIP(r, controller.Cfg.RealIPHeader)
 	user, err := helpers.EmailExists(dbMap, email)
 	if err == nil {
 		log.Infof("PasswordReset POST from %v, email %v", remoteIP,
@@ -1401,10 +1286,10 @@ func (controller *MainController) PasswordResetPost(c web.C, r *http.Request) (s
 		t := time.Now()
 		expires := t.Add(time.Hour * 1)
 
-		token := randToken()
+		token := models.NewUserToken()
 		passReset := &models.PasswordReset{
 			UserId:  user.Id,
-			Token:   token,
+			Token:   token.String(),
 			Created: t.Unix(),
 			Expires: expires.Unix(),
 		}
@@ -1415,15 +1300,7 @@ func (controller *MainController) PasswordResetPost(c web.C, r *http.Request) (s
 			return controller.PasswordReset(c, r)
 		}
 
-		body := "A request to reset your password was made from IP address: " +
-			remoteIP + "\r\n\n" +
-			"If you made this request, follow the link below:\r\n\n" +
-			controller.baseURL + "/passwordupdate?t=" + token + "\r\n\n" +
-			"The above link expires an hour after this email was sent.\r\n\n" +
-			"If you did not make this request, you may safely ignore this " +
-			"email.\r\n" + "However, you may want to look into how this " +
-			"happened.\r\n"
-		err := controller.SendMail(user.Email, "Stake pool password reset", body)
+		err := controller.Cfg.EmailSender.PasswordChangeRequest(user.Email, remoteIP, controller.Cfg.BaseURL, token.String())
 		if err != nil {
 			session.AddFlash("Unable to send password reset email", "passwordresetError")
 			log.Errorf("error sending password reset email %v", err)
@@ -1441,83 +1318,73 @@ func (controller *MainController) PasswordResetPost(c web.C, r *http.Request) (s
 	return controller.PasswordReset(c, r)
 }
 
-// PasswordUpdate renders the password update page.
+// PasswordUpdate renders the password update page. When a user clicks the link
+// containing a token in the password reset email, this handler will validate
+// the token. When the token is valid, the user will be presented with forms to
+// enter their new password. PasswordUpdatePost handles the submission of these
+// forms, and calls PasswordUpdate again for page rendering.
 func (controller *MainController) PasswordUpdate(c web.C, r *http.Request) (string, int) {
 	t := controller.GetTemplate(c)
 	session := controller.GetSession(c)
-	dbMap := controller.GetDbMap(c)
+	c.Env[csrf.TemplateTag] = csrf.TemplateField(r)
 
-	// validate that the token is set, valid, and not expired.
-	token := r.URL.Query().Get("t")
+	render := func() string {
+		c.Env["Title"] = "Decred Voting Service - Password Update"
+		c.Env["FlashError"] = session.Flashes("passwordupdateError")
+		c.Env["FlashSuccess"] = session.Flashes("passwordupdateSuccess")
+		c.Env["IsPasswordUpdate"] = true
+		widgets := controller.Parse(t, "passwordupdate", c.Env)
+		c.Env["Designation"] = controller.Cfg.Designation
 
-	if token != "" {
-		passwordReset, err := helpers.PasswordResetTokenExists(dbMap, token)
-		if err != nil {
-			session.AddFlash("Password update token not valid", "passwordupdateError")
-		} else {
-			if passwordReset.Expires-time.Now().Unix() <= 0 {
-				session.AddFlash("Password update token has expired", "passwordupdateError")
-			}
-		}
-	} else {
-		session.AddFlash("No password update token present", "passwordupdateError")
+		c.Env["Content"] = template.HTML(widgets)
+		return controller.Parse(t, "main", c.Env)
 	}
 
-	c.Env["FlashError"] = session.Flashes("passwordupdateError")
-	c.Env["FlashSuccess"] = session.Flashes("passwordupdateSuccess")
+	// Just render the page if the POST handler already checked the token.
+	_, tokenChecked := c.Env["TokenValid"].(bool)
+	if tokenChecked {
+		return render(), http.StatusOK
+	}
 
-	widgets := controller.Parse(t, "passwordupdate", c.Env)
-	c.Env["IsPasswordUpdate"] = true
-	c.Env["Title"] = "Decred Stake Pool - Password Update"
-	c.Env["Content"] = template.HTML(widgets)
-
-	return controller.Parse(t, "main", c.Env), http.StatusOK
+	// Use CheckPasswordResetToken to set relevant flash messages.
+	controller.CheckPasswordResetToken(r.URL.Query().Get("t"), c)
+	return render(), http.StatusOK
 }
 
-// PasswordUpdatePost handles updating passwords.
+// PasswordUpdatePost handles updating passwords. The token in the URL is from
+// the password reset email. The token is validated and the password is changed.
 func (controller *MainController) PasswordUpdatePost(c web.C, r *http.Request) (string, int) {
 	session := controller.GetSession(c)
+	c.Env[csrf.TemplateTag] = csrf.TemplateField(r)
 	dbMap := controller.GetDbMap(c)
-	remoteIP := getClientIP(r, controller.realIPHeader)
+	remoteIP := getClientIP(r, controller.Cfg.RealIPHeader)
 
-	// validate that the token is set and not expired.
-	token := r.URL.Query().Get("t")
-
-	if token == "" {
-		session.AddFlash("No password update token present", "passwordupdateError")
+	// Ensure a valid password reset token is provided. If the token is valid,
+	// return the decoded UserToken and PasswordReset data for the token.
+	token, resetData, tokenOK := controller.CheckPasswordResetToken(
+		r.URL.Query().Get("t"), c)
+	c.Env["TokenValid"] = tokenOK
+	// tokenChecked will be true regardless of token validity.
+	if !tokenOK {
 		return controller.PasswordUpdate(c, r)
 	}
 
-	passwordReset, err := helpers.PasswordResetTokenExists(dbMap, token)
-	if err != nil {
-		log.Errorf("error updating password %v", err)
-		session.AddFlash("Password update token not valid",
-			"passwordupdateError")
-		return controller.PasswordUpdate(c, r)
-	}
-
-	if passwordReset.Expires-time.Now().Unix() <= 0 {
-		session.AddFlash("Password update token has expired",
-			"passwordupdateError")
-		return controller.PasswordUpdate(c, r)
-	}
-
-	password, passwordRepeat := r.FormValue("password"),
-		r.FormValue("passwordrepeat")
+	// Given a valid password reset token, process the password change.
+	password := r.FormValue("password")
 	if password == "" {
-		session.AddFlash("Password cannot be empty", "passwordupdateError")
+		session.AddFlash("Password cannot be empty.", "passwordupdateError")
 		return controller.PasswordUpdate(c, r)
 	}
-
+	passwordRepeat := r.FormValue("passwordrepeat")
 	if password != passwordRepeat {
-		session.AddFlash("Passwords do not match", "passwordupdateError")
+		session.AddFlash("Passwords do not match.", "passwordupdateError")
 		return controller.PasswordUpdate(c, r)
 	}
 
-	user, err := helpers.UserIDExists(dbMap, passwordReset.UserId)
+	user, err := helpers.UserIDExists(dbMap, resetData.UserId)
 	if err != nil {
 		log.Infof("UserIDExists failure %v, %v", err, remoteIP)
-		session.AddFlash("Unable to find User ID", "passwordupdateError")
+		session.AddFlash("Unable to find User ID.", "passwordupdateError")
 		return controller.PasswordUpdate(c, r)
 	}
 
@@ -1525,11 +1392,11 @@ func (controller *MainController) PasswordUpdatePost(c web.C, r *http.Request) (
 		user.Email)
 
 	user.HashPassword(password)
-	_, err = helpers.UpdateUserPasswordById(dbMap, passwordReset.UserId,
+	_, err = helpers.UpdateUserPasswordById(dbMap, resetData.UserId,
 		user.Password)
 	if err != nil {
 		log.Errorf("error updating password %v", err)
-		session.AddFlash("Unable to update password", "passwordupdateError")
+		session.AddFlash("Unable to update password.", "passwordupdateError")
 		return controller.PasswordUpdate(c, r)
 	}
 
@@ -1538,6 +1405,11 @@ func (controller *MainController) PasswordUpdatePost(c web.C, r *http.Request) (
 		log.Errorf("error deleting token %v", err)
 	}
 
+	// destroy session data
+	if err := system.DestroySessionsForUserID(dbMap, user.Id); err != nil {
+		log.Warnf("PasswordUpdatePost: DestroySessionsForUserID '%v' failed: %v",
+			user.Id, err)
+	}
 	session.AddFlash("Password successfully updated", "passwordupdateSuccess")
 	return controller.PasswordUpdate(c, r)
 }
@@ -1545,54 +1417,36 @@ func (controller *MainController) PasswordUpdatePost(c web.C, r *http.Request) (
 // Settings renders the settings page.
 func (controller *MainController) Settings(c web.C, r *http.Request) (string, int) {
 	session := controller.GetSession(c)
-	dbMap := controller.GetDbMap(c)
+	c.Env[csrf.TemplateTag] = csrf.TemplateField(r)
 
 	if session.Values["UserId"] == nil {
 		return "/", http.StatusSeeOther
 	}
 
-	user, _ := models.GetUserById(dbMap, session.Values["UserId"].(int64))
-
-	// Generate an API Token for the user on demand if one does not exist and
-	// refresh the user's data before displaying it.
-	if user.APIToken == "" {
-		err := models.SetUserAPIToken(dbMap, controller.APISecret,
-			controller.baseURL, user.Id)
-		if err != nil {
-			session.AddFlash("Unable to set API Token", "settingsError")
-			log.Errorf("could not set API Token for UserId %v", user.Id)
-		}
-
-		user, _ = models.GetUserById(dbMap, session.Values["UserId"].(int64))
-	}
-
-	t := controller.GetTemplate(c)
-
 	c.Env["Admin"], _ = controller.isAdmin(c, r)
-	c.Env["APIToken"] = user.APIToken
 	c.Env["FlashError"] = session.Flashes("settingsError")
 	c.Env["FlashSuccess"] = session.Flashes("settingsSuccess")
 	c.Env["IsSettings"] = true
-	c.Env["RecaptchaSiteKey"] = controller.recaptchaSiteKey
-	if user.MultiSigAddress == "" {
-		c.Env["ShowInstructions"] = true
-	}
-	if controller.smtpHost == "" {
-		c.Env["SMTPDisabled"] = true
-	}
+	c.Env["CaptchaID"] = captcha.New()
+	c.Env["CaptchaMsg"] = "To change your email address, first complete the captcha:"
+	c.Env["CaptchaError"] = session.Flashes("captchaFailed")
 
+	t := controller.GetTemplate(c)
 	widgets := controller.Parse(t, "settings", c.Env)
-	c.Env["Title"] = "Decred Stake Pool - Settings"
-	c.Env["Content"] = template.HTML(widgets)
 
+	c.Env["Title"] = "Decred Voting Service - Settings"
+	c.Env["Designation"] = controller.Cfg.Designation
+
+	c.Env["Content"] = template.HTML(widgets)
 	return controller.Parse(t, "main", c.Env), http.StatusOK
 }
 
 // SettingsPost handles changing the user's email address or password.
 func (controller *MainController) SettingsPost(c web.C, r *http.Request) (string, int) {
 	session := controller.GetSession(c)
+	c.Env[csrf.TemplateTag] = csrf.TemplateField(r)
 	dbMap := controller.GetDbMap(c)
-	remoteIP := getClientIP(r, controller.realIPHeader)
+	remoteIP := getClientIP(r, controller.Cfg.RealIPHeader)
 
 	if session.Values["UserId"] == nil {
 		return "/", http.StatusSeeOther
@@ -1601,6 +1455,16 @@ func (controller *MainController) SettingsPost(c web.C, r *http.Request) (string
 	password, updateEmail, updatePassword := r.FormValue("password"),
 		r.FormValue("updateEmail"), r.FormValue("updatePassword")
 
+	if updateEmail == "true" {
+		if !controller.IsCaptchaDone(c) {
+			session.AddFlash("You must complete the captcha.", "settingsError")
+			return controller.Settings(c, r)
+		}
+		session.Values["CaptchaDone"] = false
+		c.Env["CaptchaDone"] = false
+	}
+
+	// Changes to email or password require the current password.
 	user, err := helpers.PasswordValidById(dbMap, session.Values["UserId"].(int64), password)
 	if err != nil {
 		session.AddFlash("Password not valid", "settingsError")
@@ -1613,19 +1477,7 @@ func (controller *MainController) SettingsPost(c web.C, r *http.Request) (string
 		newEmail := r.FormValue("email")
 		log.Infof("user requested email change from %v to %v", user.Email, newEmail)
 
-		re := recaptcha.R{
-			Secret: controller.recaptchaSecret,
-		}
-
-		isValid := re.Verify(*r)
-		if !isValid {
-			session.AddFlash("Recaptcha error", "settingsError")
-			log.Errorf("Recaptcha error %v", re.LastError())
-			return controller.Settings(c, r)
-		}
-
 		userExists := models.GetUserByEmail(dbMap, newEmail)
-
 		if userExists != nil {
 			session.AddFlash("Email address in use", "settingsError")
 			return controller.Settings(c, r)
@@ -1634,11 +1486,11 @@ func (controller *MainController) SettingsPost(c web.C, r *http.Request) (string
 		t := time.Now()
 		expires := t.Add(time.Hour * 1)
 
-		token := randToken()
+		token := models.NewUserToken()
 		emailChange := &models.EmailChange{
 			UserId:   user.Id,
 			NewEmail: newEmail,
-			Token:    token,
+			Token:    token.String(),
 			Created:  t.Unix(),
 			Expires:  expires.Unix(),
 		}
@@ -1649,17 +1501,7 @@ func (controller *MainController) SettingsPost(c web.C, r *http.Request) (string
 			return controller.Settings(c, r)
 		}
 
-		bodyNew := "A request was made to change the email address\r\n" +
-			"for a stake pool account at " + controller.baseURL + "\r\n" +
-			"from " + user.Email + " to " + newEmail + "\r\n\n" +
-			"The request was made from IP address " + remoteIP + "\r\n\n" +
-			"If you made this request, follow the link below:\r\n\n" +
-			controller.baseURL + "/emailupdate?t=" + token + "\r\n\n" +
-			"The above link expires an hour after this email was sent.\r\n\n" +
-			"If you did not make this request, you may safely ignore this " +
-			"email.\r\n" + "However, you may want to look into how this " +
-			"happened.\r\n"
-		err = controller.SendMail(newEmail, "Stake pool email change", bodyNew)
+		err = controller.Cfg.EmailSender.EmailChangeVerification(controller.Cfg.BaseURL, user.Email, newEmail, remoteIP, token.String())
 		if err != nil {
 			session.AddFlash("Unable to send email change token.",
 				"settingsError")
@@ -1670,19 +1512,13 @@ func (controller *MainController) SettingsPost(c web.C, r *http.Request) (string
 				"settingsSuccess")
 		}
 
-		bodyOld := "A request was made to change the email address\r\n" +
-			"for your stake pool account at " + controller.baseURL + "\r\n" +
-			"from " + user.Email + " to " + newEmail + "\r\n\n" +
-			"The request was made from IP address " + remoteIP + "\r\n\n" +
-			"If you did not make this request, please contact the \r\n" +
-			"stake pool administrator immediately.\r\n"
-		err = controller.SendMail(user.Email, "Stake pool email change",
-			bodyOld)
-		// this likely has the same status as the above email so don't
+		err = controller.Cfg.EmailSender.EmailChangeNotification(controller.Cfg.BaseURL, user.Email, newEmail, remoteIP)
 		// inform the user.
 		if err != nil {
 			log.Errorf("error sending email change token to old address %v %v",
 				user.Email, err)
+			session.AddFlash("Failed to send email change verification email. "+
+				"Please contact the site admin.", "settingsError")
 		}
 	} else if updatePassword == "true" {
 		newPassword, newPasswordRepeat := r.FormValue("newpassword"),
@@ -1701,186 +1537,191 @@ func (controller *MainController) SettingsPost(c web.C, r *http.Request) (string
 			return controller.Settings(c, r)
 		}
 
+		// destroy session data
+		err := system.DestroySessionsForUserID(dbMap, user.Id)
+		if err != nil {
+			log.Warnf("SettingsPost: DestroySessionsForUserId '%v' failed: %v", user.Id, err)
+		}
+
 		// send a confirmation email.
-		body := "Your stake pool password for " + controller.baseURL + "\r\n" +
-			"was just changed by IP Address " + remoteIP + "\r\n\n" +
-			"If you did not make this request, please contact the \r\n" +
-			"stake pool administrator immediately.\r\n"
-		err = controller.SendMail(user.Email, "Stake pool password change",
-			body)
+		err = controller.Cfg.EmailSender.PasswordChangeConfirm(user.Email, controller.Cfg.BaseURL, remoteIP)
 		if err != nil {
 			log.Errorf("error sending password change confirmation %v %v",
 				user.Email, err)
+			session.AddFlash("Failed to send password change email. "+
+				"Please contact the site admin.", "settingsError")
+		} else {
+			session.AddFlash("Password successfully updated", "settingsSuccess")
 		}
-
-		session.AddFlash("Password successfully updated", "settingsSuccess")
 	}
 
 	return controller.Settings(c, r)
 }
 
-// SignIn renders the signin page.
-func (controller *MainController) SignIn(c web.C, r *http.Request) (string, int) {
+// Login renders the login page.
+func (controller *MainController) Login(c web.C, r *http.Request) (string, int) {
 	t := controller.GetTemplate(c)
 	session := controller.GetSession(c)
+	c.Env[csrf.TemplateTag] = csrf.TemplateField(r)
 
 	// Tell main.html what route is being rendered
-	c.Env["IsSignIn"] = true
+	c.Env["isLogin"] = true
 
-	c.Env["Flash"] = session.Flashes("auth")
-	widgets := controller.Parse(t, "auth/signin", c.Env)
+	c.Env["FlashError"] = session.Flashes("loginError")
 
-	c.Env["Title"] = "Decred Stake Pool - Sign In"
+	widgets := controller.Parse(t, "auth/login", c.Env)
+
+	c.Env["Title"] = "Decred VSP - Login"
+	c.Env["Designation"] = controller.Cfg.Designation
+
 	c.Env["Content"] = template.HTML(widgets)
 
 	return controller.Parse(t, "main", c.Env), http.StatusOK
 }
 
-// SignInPost is the form submit route. Logs user in or sets an appropriate message in
+// LoginPost is the form submit route. Logs user in or sets an appropriate message in
 // session if login was not successful.
-func (controller *MainController) SignInPost(c web.C, r *http.Request) (string, int) {
+func (controller *MainController) LoginPost(c web.C, r *http.Request) (string, int) {
 	email, password := r.FormValue("email"), r.FormValue("password")
 
 	session := controller.GetSession(c)
+	c.Env[csrf.TemplateTag] = csrf.TemplateField(r)
 	dbMap := controller.GetDbMap(c)
-	remoteIP := getClientIP(r, controller.realIPHeader)
+	remoteIP := getClientIP(r, controller.Cfg.RealIPHeader)
 
 	// Validate email and password combination.
 	user, err := helpers.Login(dbMap, email, password)
 	if err != nil {
 		log.Infof(email+" login failed %v, %v", err, remoteIP)
-		session.AddFlash("Invalid Email or Password", "auth")
-		return controller.SignIn(c, r)
+		session.AddFlash("Invalid Email or Password", "loginError")
+		return controller.Login(c, r)
 	}
 
-	log.Infof("SignIn POST from %v, email %v", remoteIP, user.Email)
+	log.Infof("Login POST from %v, email %v", remoteIP, user.Email)
 
 	if user.EmailVerified == 0 {
-		session.AddFlash("You must validate your email address", "auth")
-		return controller.SignIn(c, r)
+		session.AddFlash("You must validate your email address", "loginError")
+		return controller.Login(c, r)
 	}
 
 	session.Values["UserId"] = user.Id
 
-	// Go to Settings page if multisig script not yet set up.
-	// GUI users can copy and paste their API Token from here
-	// or follow the notice that directs them to the address page.
+	// Go to Address page if multisig script not yet set up.
+	// GUI users can copy their API Token from here.
+	// CLI users can paste their pubkey address
 	if user.MultiSigAddress == "" {
-		return "/settings", http.StatusSeeOther
+		return "/address", http.StatusSeeOther
 	}
 
 	// Go to Tickets page if user already set up.
 	return "/tickets", http.StatusSeeOther
 }
 
-// SignUp renders the signup page.
-func (controller *MainController) SignUp(c web.C, r *http.Request) (string, int) {
-	t := controller.GetTemplate(c)
-	session := controller.GetSession(c)
-
+// Register renders the register page.
+func (controller *MainController) Register(c web.C, r *http.Request) (string, int) {
 	// Tell main.html what route is being rendered
-	c.Env["IsSignUp"] = true
-	if controller.smtpHost == "" {
-		c.Env["SMTPDisabled"] = true
-	}
-	if controller.closePool {
+	c.Env["isRegister"] = true
+	if controller.Cfg.ClosePool {
 		c.Env["IsClosed"] = true
-		c.Env["ClosePoolMsg"] = controller.closePoolMsg
+		c.Env["ClosePoolMsg"] = controller.Cfg.ClosePoolMsg
 	}
 
-	c.Env["FlashError"] = session.Flashes("signupError")
-	c.Env["FlashSuccess"] = session.Flashes("signupSuccess")
-	c.Env["RecaptchaSiteKey"] = controller.recaptchaSiteKey
+	session := controller.GetSession(c)
+	c.Env[csrf.TemplateTag] = csrf.TemplateField(r)
+	c.Env["FlashError"] = session.Flashes("registrationError")
+	c.Env["FlashSuccess"] = session.Flashes("registrationSuccess")
+	c.Env["CaptchaID"] = captcha.New()
+	c.Env["CaptchaMsg"] = "To register, first complete the captcha:"
+	c.Env["CaptchaError"] = session.Flashes("captchaFailed")
 
-	widgets := controller.Parse(t, "auth/signup", c.Env)
+	t := controller.GetTemplate(c)
+	widgets := controller.Parse(t, "auth/register", c.Env)
 
-	c.Env["Title"] = "Decred Stake Pool - Sign Up"
+	c.Env["Title"] = "Decred VSP - Register"
+	c.Env["Designation"] = controller.Cfg.Designation
+
 	c.Env["Content"] = template.HTML(widgets)
-
 	return controller.Parse(t, "main", c.Env), http.StatusOK
 }
 
-// SignUpPost form submit route. Registers new user or shows Sign Up route with appropriate
-// messages set in session.
-func (controller *MainController) SignUpPost(c web.C, r *http.Request) (string, int) {
-	if controller.closePool {
-		log.Infof("attempt to signup while registration disabled")
-		return "/error?r=/signup", http.StatusSeeOther
-	}
-
-	re := recaptcha.R{
-		Secret: controller.recaptchaSecret,
+// RegisterPost form submit route. Registers new user or shows Registration route with
+// appropriate messages set in session.
+func (controller *MainController) RegisterPost(c web.C, r *http.Request) (string, int) {
+	if controller.Cfg.ClosePool {
+		log.Infof("attempt to register while registration disabled")
+		return "/error", http.StatusSeeOther
 	}
 
 	session := controller.GetSession(c)
-	remoteIP := getClientIP(r, controller.realIPHeader)
+	c.Env[csrf.TemplateTag] = csrf.TemplateField(r)
+	if !controller.IsCaptchaDone(c) {
+		session.AddFlash("You must complete the captcha.", "registrationError")
+		return controller.Register(c, r)
+	}
+
+	remoteIP := getClientIP(r, controller.Cfg.RealIPHeader)
 
 	email, password, passwordRepeat := r.FormValue("email"),
 		r.FormValue("password"), r.FormValue("passwordrepeat")
 
 	if !strings.Contains(email, "@") {
-		session.AddFlash("email address is invalid", "signupError")
-		return controller.SignUp(c, r)
+		session.AddFlash("Email address is invalid", "registrationError")
+		return controller.Register(c, r)
 	}
 
 	if password == "" {
-		session.AddFlash("password cannot be empty", "signupError")
-		return controller.SignUp(c, r)
+		session.AddFlash("Password cannot be empty", "registrationError")
+		return controller.Register(c, r)
 	}
 
 	if password != passwordRepeat {
-		session.AddFlash("passwords do not match", "signupError")
-		return controller.SignUp(c, r)
+		session.AddFlash("Passwords do not match", "registrationError")
+		return controller.Register(c, r)
 	}
 
-	isValid := re.Verify(*r)
-	if !isValid {
-		session.AddFlash("Recaptcha error", "signupError")
-		log.Errorf("Recaptcha error %v", re.LastError())
-		return controller.SignUp(c, r)
-	}
+	// At this point we have completed all trivial pre-registration checks. The new account
+	// is about to be created, so lets consume the CAPTCHA. Any failure beyond this point
+	// and we want the user to complete another CAPTCHA.
+	session.Values["CaptchaDone"] = false
+	c.Env["CaptchaDone"] = false
 
 	dbMap := controller.GetDbMap(c)
 	user := models.GetUserByEmail(dbMap, email)
 
 	if user != nil {
-		session.AddFlash("User exists", "signupError")
-		return controller.SignUp(c, r)
+		session.AddFlash("This email address is already registered", "registrationError")
+		return controller.Register(c, r)
 	}
 
-	token := randToken()
+	token := models.NewUserToken()
 	user = &models.User{
 		Username:        email,
 		Email:           email,
-		EmailToken:      token,
+		EmailToken:      token.String(),
 		EmailVerified:   0,
 		VoteBits:        1,
 		VoteBitsVersion: int64(controller.voteVersion),
 	}
 	user.HashPassword(password)
 
-	log.Infof("SignUp POST from %v, email %v. Inserting.", remoteIP, user.Email)
+	log.Infof("Register POST from %v, email %v. Inserting.", remoteIP, user.Email)
 
-	if err := models.InsertUser(dbMap, user); err != nil {
-		session.AddFlash("Database error occurred while adding user", "signupError")
+	err := models.InsertUser(dbMap, user)
+	if err != nil {
+		session.AddFlash("Database error occurred while adding user", "registrationError")
 		log.Errorf("Error while registering user: %v", err)
-		return controller.SignUp(c, r)
+		return controller.Register(c, r)
 	}
 
-	body := signupEmailTemplate
-	body = strings.Replace(body, "__URL__", controller.baseURL, -1)
-	body = strings.Replace(body, "__REMOTEIP__", remoteIP, -1)
-	body = strings.Replace(body, "__TOKEN__", token, -1)
-
-	err := controller.SendMail(user.Email, signupEmailSubject, body)
+	err = controller.Cfg.EmailSender.Registration(email, controller.Cfg.BaseURL, remoteIP, token.String())
 	if err != nil {
-		session.AddFlash("Unable to send signup email", "signupError")
+		session.AddFlash("Unable to send verification email", "registrationError")
 		log.Errorf("error sending verification email %v", err)
 	} else {
-		session.AddFlash("A verification email has been sent to "+email, "signupSuccess")
+		session.AddFlash("A verification email has been sent to "+email, "registrationSuccess")
 	}
 
-	return controller.SignUp(c, r)
+	return controller.Register(c, r)
 }
 
 // Stats renders the stats page.
@@ -1888,35 +1729,30 @@ func (controller *MainController) Stats(c web.C, r *http.Request) (string, int) 
 	t := controller.GetTemplate(c)
 	c.Env["Admin"], _ = controller.isAdmin(c, r)
 	c.Env["IsStats"] = true
-	c.Env["Title"] = "Decred Stake Pool - Stats"
+	c.Env["Title"] = "Decred VSP - Stats"
 
 	dbMap := controller.GetDbMap(c)
 
 	userCount := models.GetUserCount(dbMap)
 	userCountActive := models.GetUserCountActive(dbMap)
 
-	if controller.RPCIsStopped() {
+	gsi, err := controller.Cfg.StakepooldServers.GetStakeInfo()
+	if err != nil {
+		log.Errorf("RPC GetStakeInfo failed: %v", err)
 		return "/error", http.StatusSeeOther
 	}
-	gsi, err := controller.rpcServers.GetStakeInfo()
-	if err != nil {
-		log.Infof("RPC GetStakeInfo failed: %v", err)
-		return "/error?r=/stats", http.StatusSeeOther
-	}
 
-	c.Env["Network"] = controller.params.Name
-	if controller.closePool {
-		c.Env["PoolStatus"] = "Closed"
-	} else {
-		c.Env["PoolStatus"] = "Open"
-	}
-	c.Env["PoolEmail"] = controller.poolEmail
-	c.Env["PoolFees"] = controller.poolFees
+	c.Env["DCRDataURL"] = controller.DCRDataURL
+
+	c.Env["PoolEmail"] = controller.Cfg.PoolEmail
+	c.Env["PoolFees"] = controller.Cfg.PoolFees
 	c.Env["StakeInfo"] = gsi
 	c.Env["UserCount"] = userCount
 	c.Env["UserCountActive"] = userCountActive
 
 	widgets := controller.Parse(t, "stats", c.Env)
+	c.Env["Designation"] = controller.Cfg.Designation
+
 	c.Env["Content"] = template.HTML(widgets)
 
 	return controller.Parse(t, "main", c.Env), http.StatusOK
@@ -1924,7 +1760,7 @@ func (controller *MainController) Stats(c web.C, r *http.Request) (string, int) 
 
 // ByTicketHeight type implements sort.Sort for types with a TicketHeight field.
 // This includes all valid tickets, including spend tickets.
-type ByTicketHeight []TicketInfoLive
+type ByTicketHeight []TicketInfo
 
 func (a ByTicketHeight) Len() int {
 	return len(a)
@@ -1964,37 +1800,32 @@ type TicketInfoInvalid struct {
 	Ticket string
 }
 
-// TicketInfoLive represents live or immature (mined) tickets that have yet to
+// TicketInfo represents live or immature tickets that have yet to
 // be spent by either a vote or revocation.
-type TicketInfoLive struct {
+type TicketInfo struct {
 	TicketHeight uint32
 	Ticket       string
 }
 
 // Tickets renders the tickets page.
 func (controller *MainController) Tickets(c web.C, r *http.Request) (string, int) {
-
 	var ticketInfoInvalid []TicketInfoInvalid
-	var ticketInfoLive []TicketInfoLive
+	var ticketInfoLive, ticketInfoImmature []TicketInfo
 	var ticketInfoVoted, ticketInfoExpired, ticketInfoMissed []TicketInfoHistoric
 	var numVoted int
 
-	responseHeaderMap := make(map[string]string)
-	c.Env["ResponseHeaderMap"] = responseHeaderMap
-	// map is a reference type so responseHeaderMap may be modified
-
 	t := controller.GetTemplate(c)
 	session := controller.GetSession(c)
-	remoteIP := getClientIP(r, controller.realIPHeader)
+	c.Env[csrf.TemplateTag] = csrf.TemplateField(r)
+	remoteIP := getClientIP(r, controller.Cfg.RealIPHeader)
 
 	if session.Values["UserId"] == nil {
 		return "/", http.StatusSeeOther
 	}
 
 	c.Env["IsTickets"] = true
-	c.Env["Network"] = controller.getNetworkName()
-	c.Env["PoolFees"] = controller.poolFees
-	c.Env["Title"] = "Decred Stake Pool - Tickets"
+	c.Env["DCRDataURL"] = controller.DCRDataURL
+	c.Env["Title"] = "Decred VSP - Tickets"
 
 	dbMap := controller.GetDbMap(c)
 	user, _ := models.GetUserById(dbMap, session.Values["UserId"].(int64))
@@ -2004,55 +1835,43 @@ func (controller *MainController) Tickets(c web.C, r *http.Request) (string, int
 		return "/address", http.StatusSeeOther
 	}
 
-	if controller.RPCIsStopped() {
-		return "/error", http.StatusSeeOther
-	}
-
 	// Get P2SH Address
-	multisig, err := dcrutil.DecodeAddress(user.MultiSigAddress)
+	multisig, err := dcrutil.DecodeAddress(user.MultiSigAddress, controller.Cfg.NetParams)
 	if err != nil {
-		log.Infof("Invalid address %v in database: %v", user.MultiSigAddress, err)
+		log.Warnf("Invalid address %v in database: %v", user.MultiSigAddress, err)
 		return "/error", http.StatusSeeOther
 	}
 
 	log.Infof("Tickets GET from %v, multisig %v", remoteIP,
 		user.MultiSigAddress)
 
-	w := controller.rpcServers
-
 	start := time.Now()
 
-	spui, err := w.StakePoolUserInfo(multisig, true)
+	spui, err := controller.Cfg.StakepooldServers.StakePoolUserInfo(multisig.String())
 	if err != nil {
 		// Render page with message to try again later
-		log.Infof("RPC StakePoolUserInfo failed: %v", err)
-		session.AddFlash("Unable to retrieve stake pool user info", "main")
-		c.Env["Flash"] = session.Flashes("main")
-		return controller.Parse(t, "main", c.Env), http.StatusInternalServerError
+		log.Errorf("RPC StakePoolUserInfo failed: %v", err)
+		return "/error", http.StatusSeeOther
 	}
 
 	log.Debugf(":: StakePoolUserInfo (msa = %v) execution time: %v",
 		user.MultiSigAddress, time.Since(start))
 
-	// Compute the oldest (min) ticket spend height to include in the table
-	_, height, err := w.GetBestBlock()
-	if err != nil {
-		log.Infof("RPC GetBestBlock failed: %v", err)
-		session.AddFlash("Unable to get best block height", "main")
-		c.Env["Flash"] = session.Flashes("main")
-		return controller.Parse(t, "main", c.Env), http.StatusInternalServerError
-	}
-	minVotedHeight := height - controller.maxVotedAge
-
 	// If the user has tickets, get their info
 	if spui != nil && len(spui.Tickets) > 0 {
 		for _, ticket := range spui.Tickets {
 			switch ticket.Status {
-			case "live":
-				ticketInfoLive = append(ticketInfoLive, TicketInfoLive{
+			case "immature":
+				ticketInfoImmature = append(ticketInfoImmature, TicketInfo{
 					TicketHeight: ticket.TicketHeight,
 					Ticket:       ticket.Ticket,
 				})
+			case "live":
+				ticketInfoLive = append(ticketInfoLive, TicketInfo{
+					TicketHeight: ticket.TicketHeight,
+					Ticket:       ticket.Ticket,
+				})
+
 			case "expired":
 				ticketInfoExpired = append(ticketInfoExpired, TicketInfoHistoric{
 					Ticket:        ticket.Ticket,
@@ -2066,18 +1885,17 @@ func (controller *MainController) Tickets(c web.C, r *http.Request) (string, int
 					TicketHeight:  ticket.TicketHeight,
 				})
 			case "voted":
-				numVoted++
-				if int64(ticket.SpentByHeight) >= minVotedHeight {
-					ticketInfoVoted = append(ticketInfoVoted, TicketInfoHistoric{
-						Ticket:        ticket.Ticket,
-						SpentBy:       ticket.SpentBy,
-						SpentByHeight: ticket.SpentByHeight,
-						TicketHeight:  ticket.TicketHeight,
-					})
-				}
+				ticketInfoVoted = append(ticketInfoVoted, TicketInfoHistoric{
+					Ticket:        ticket.Ticket,
+					SpentBy:       ticket.SpentBy,
+					SpentByHeight: ticket.SpentByHeight,
+					TicketHeight:  ticket.TicketHeight,
+				})
 			}
 		}
 	}
+
+	numVoted = len(ticketInfoVoted)
 
 	if spui != nil && len(spui.InvalidTickets) > 0 {
 		for _, ticket := range spui.InvalidTickets {
@@ -2085,24 +1903,31 @@ func (controller *MainController) Tickets(c web.C, r *http.Request) (string, int
 		}
 	}
 
-	// Sort live tickets. This is commented because the JS tables will perform
-	// their own sorting anyway. However, depending on the UI implementation, it
-	// may be desirable to sort it here.
-	// sort.Sort(ByTicketHeight(ticketInfoLive))
+	// Sort tickets for display. Ideally these would be sorted on the front
+	// end by javascript.
+	sort.Sort(sort.Reverse(ByTicketHeight(ticketInfoLive)))
+	sort.Sort(sort.Reverse(ByTicketHeight(ticketInfoImmature)))
+	sort.Sort(sort.Reverse(BySpentByHeight(ticketInfoExpired)))
+	sort.Sort(sort.Reverse(BySpentByHeight(ticketInfoVoted)))
+	sort.Sort(sort.Reverse(BySpentByHeight(ticketInfoMissed)))
 
-	// Sort historic (voted and revoked) tickets
-	sort.Sort(BySpentByHeight(ticketInfoVoted))
-	sort.Sort(BySpentByHeight(ticketInfoMissed))
+	// Truncate the slice of voted tickets if there are too many
+	if len(ticketInfoVoted) > controller.Cfg.MaxVotedTickets {
+		ticketInfoVoted = ticketInfoVoted[0:controller.Cfg.MaxVotedTickets]
+	}
 
 	c.Env["Admin"], _ = controller.isAdmin(c, r)
 	c.Env["TicketsInvalid"] = ticketInfoInvalid
+	c.Env["TicketsImmature"] = ticketInfoImmature
 	c.Env["TicketsLive"] = ticketInfoLive
 	c.Env["TicketsExpired"] = ticketInfoExpired
 	c.Env["TicketsMissed"] = ticketInfoMissed
 	c.Env["TicketsVotedCount"] = numVoted
-	c.Env["TicketsVotedArchivedCount"] = numVoted - len(ticketInfoVoted)
+	c.Env["TicketsVotedMaxDisplay"] = controller.Cfg.MaxVotedTickets
 	c.Env["TicketsVoted"] = ticketInfoVoted
 	widgets := controller.Parse(t, "tickets", c.Env)
+
+	c.Env["Designation"] = controller.Cfg.Designation
 
 	c.Env["Content"] = template.HTML(widgets)
 	c.Env["Flash"] = session.Flashes("tickets")
@@ -2113,6 +1938,7 @@ func (controller *MainController) Tickets(c web.C, r *http.Request) (string, int
 // Voting renders the voting page.
 func (controller *MainController) Voting(c web.C, r *http.Request) (string, int) {
 	session := controller.GetSession(c)
+	c.Env[csrf.TemplateTag] = csrf.TemplateField(r)
 	dbMap := controller.GetDbMap(c)
 
 	if session.Values["UserId"] == nil {
@@ -2120,6 +1946,11 @@ func (controller *MainController) Voting(c web.C, r *http.Request) (string, int)
 	}
 
 	user, _ := models.GetUserById(dbMap, session.Values["UserId"].(int64))
+
+	if user.MultiSigAddress == "" {
+		log.Info("Multisigaddress empty")
+		return "/address", http.StatusSeeOther
+	}
 
 	t := controller.GetTemplate(c)
 
@@ -2130,14 +1961,16 @@ func (controller *MainController) Voting(c web.C, r *http.Request) (string, int)
 		c.Env["Agenda"+strk+"Selected"] = v
 	}
 	c.Env["Admin"], _ = controller.isAdmin(c, r)
-	c.Env["Agendas"] = controller.getAgendas()
+	c.Env["Agendas"] = controller.agendas()
 	c.Env["FlashError"] = session.Flashes("votingError")
 	c.Env["FlashSuccess"] = session.Flashes("votingSuccess")
 	c.Env["IsVoting"] = true
 	c.Env["VoteVersion"] = controller.voteVersion
 
 	widgets := controller.Parse(t, "voting", c.Env)
-	c.Env["Title"] = "Decred Stake Pool - Voting"
+	c.Env["Title"] = "Decred Voting Service - Voting"
+	c.Env["Designation"] = controller.Cfg.Designation
+
 	c.Env["Content"] = template.HTML(widgets)
 
 	return controller.Parse(t, "main", c.Env), http.StatusOK
@@ -2146,6 +1979,7 @@ func (controller *MainController) Voting(c web.C, r *http.Request) (string, int)
 // VotingPost form submit route.
 func (controller *MainController) VotingPost(c web.C, r *http.Request) (string, int) {
 	session := controller.GetSession(c)
+	c.Env[csrf.TemplateTag] = csrf.TemplateField(r)
 	dbMap := controller.GetDbMap(c)
 
 	if session.Values["UserId"] == nil {
@@ -2187,18 +2021,24 @@ func (controller *MainController) VotingPost(c web.C, r *http.Request) (string, 
 	log.Infof("updated voteBits for user %d from %d to %d",
 		user.Id, oldVoteBits, generatedVoteBits)
 	if uint16(oldVoteBits) != generatedVoteBits {
-		controller.StakepooldUpdateAll(dbMap, StakepooldUpdateKindUsers)
+		if err := controller.StakepooldUpdateUsers(dbMap); err != nil {
+			log.Errorf("unable to update all: %v", err)
+		}
 	}
 
-	session.AddFlash("successfully updated voting preferences", "votingSuccess")
+	session.AddFlash("Successfully updated voting preferences", "votingSuccess")
 	return "/voting", http.StatusSeeOther
 }
 
 // Logout the user.
 func (controller *MainController) Logout(c web.C, r *http.Request) (string, int) {
 	session := controller.GetSession(c)
+	c.Env[csrf.TemplateTag] = csrf.TemplateField(r)
+	if session.Values["UserId"] == nil {
+		return "/", http.StatusSeeOther
+	}
 
-	session.Values["UserId"] = nil
+	session.Options.MaxAge = -1
 
 	return "/", http.StatusSeeOther
 }
@@ -2227,12 +2067,10 @@ func (controller *MainController) choicesForAgendas(userVoteBits uint16) map[int
 }
 
 func (controller *MainController) getAgendas() []chaincfg.ConsensusDeployment {
-	if controller.params.Deployments == nil {
+	if controller.Cfg.NetParams.Deployments == nil {
 		return nil
 	}
-
-	return controller.params.Deployments[controller.voteVersion]
-
+	return controller.Cfg.NetParams.Deployments[controller.voteVersion]
 }
 
 // CalcEstimatedTicketExpiry returns a time.Time reflecting the estimated time
@@ -2246,7 +2084,7 @@ func (controller *MainController) CalcEstimatedTicketExpiry() time.Time {
 
 	// Generate an estimated expiry time for this ticket and add 5% for
 	// a margin of safety in case blocks are slower than expected
-	minutesUntilExpiryEstimate := time.Duration(controller.params.TicketExpiry) * controller.params.TargetTimePerBlock
+	minutesUntilExpiryEstimate := time.Duration(controller.Cfg.NetParams.TicketExpiry) * controller.Cfg.NetParams.TargetTimePerBlock
 	expires := t.Add(minutesUntilExpiryEstimate * 105 / 100)
 
 	return expires

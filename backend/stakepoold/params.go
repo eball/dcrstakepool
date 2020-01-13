@@ -6,7 +6,7 @@
 package main
 
 import (
-	"github.com/decred/dcrd/chaincfg"
+	"github.com/decred/dcrd/chaincfg/v2"
 	"github.com/decred/dcrd/wire"
 )
 
@@ -30,17 +30,17 @@ type params struct {
 // it does not handle on to dcrd.  This approach allows the wallet process
 // to emulate the full reference implementation RPC API.
 var mainNetParams = params{
-	Params:              &chaincfg.MainNetParams,
+	Params:              chaincfg.MainNetParams(),
 	DcrdRPCServerPort:   "9109",
 	RPCServerPort:       "9113",
 	WalletRPCServerPort: "9110",
 }
 
-// testNet2Params contains parameters specific to the test network (version 0)
+// testNet3Params contains parameters specific to the test network (version 0)
 // (wire.TestNet).  NOTE: The RPC port is intentionally different than the
 // reference implementation - see the mainNetParams comment for details.
-var testNet2Params = params{
-	Params:              &chaincfg.TestNet2Params,
+var testNet3Params = params{
+	Params:              chaincfg.TestNet3Params(),
 	DcrdRPCServerPort:   "19109",
 	RPCServerPort:       "19113",
 	WalletRPCServerPort: "19110",
@@ -49,7 +49,7 @@ var testNet2Params = params{
 // simNetParams contains parameters specific to the simulation test network
 // (wire.SimNet).
 var simNetParams = params{
-	Params:              &chaincfg.SimNetParams,
+	Params:              chaincfg.SimNetParams(),
 	DcrdRPCServerPort:   "19556",
 	RPCServerPort:       "19560",
 	WalletRPCServerPort: "19557",
@@ -66,8 +66,8 @@ var simNetParams = params{
 // removed and the network parameter's name used instead.
 func netName(chainParams *params) string {
 	switch chainParams.Net {
-	case wire.TestNet2:
-		return "testnet2"
+	case wire.TestNet3:
+		return "testnet3"
 	default:
 		return chainParams.Name
 	}

@@ -1,5 +1,5 @@
 // Copyright (c) 2013-2014 The btcsuite developers
-// Copyright (c) 2015-2016 The Decred developers
+// Copyright (c) 2015-2019 The Decred developers
 // Use of this source code is governed by an ISC
 // license that can be found in the LICENSE file.
 
@@ -12,11 +12,11 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
-	"strconv"
 	"strings"
 
-	flags "github.com/btcsuite/go-flags"
-	"github.com/decred/dcrd/dcrutil"
+	"github.com/decred/dcrd/dcrutil/v2"
+	"github.com/decred/dcrstakepool/internal/version"
+	flags "github.com/jessevdk/go-flags"
 )
 
 const (
@@ -49,33 +49,32 @@ var runServiceCommand func(string) error
 //
 // See loadConfig for details on the configuration load process.
 type config struct {
-	HomeDir          string  `short:"A" long:"appdata" description:"Path to application home directory"`
-	ShowVersion      bool    `short:"V" long:"version" description:"Display version information and exit"`
-	ConfigFile       string  `short:"C" long:"configfile" description:"Path to configuration file"`
-	DataDir          string  `short:"b" long:"datadir" description:"Directory to store data"`
-	LogDir           string  `long:"logdir" description:"Directory to log output."`
-	TestNet          bool    `long:"testnet" description:"Use the test network"`
-	SimNet           bool    `long:"simnet" description:"Use the simulation test network"`
-	Profile          string  `long:"profile" description:"Enable HTTP profiling on given port -- NOTE port must be between 1024 and 65536"`
-	CPUProfile       string  `long:"cpuprofile" description:"Write CPU profile to the specified file"`
-	MemProfile       string  `long:"memprofile" description:"Write mem profile to the specified file"`
-	DebugLevel       string  `short:"d" long:"debuglevel" description:"Logging level for all subsystems {trace, debug, info, warn, error, critical} -- You may also specify <subsystem>=<level>,<subsystem2>=<level>,... to set the log level for individual subsystems -- Use show to list available subsystems"`
-	ColdWalletExtPub string  `long:"coldwalletextpub" description:"The extended public key to send user stake pool fees to"`
-	PoolFees         float64 `long:"poolfees" description:"The per-ticket fees the user must send to the pool with their tickets"`
-	DBHost           string  `long:"dbhost" description:"Hostname for database connection"`
-	DBUser           string  `long:"dbuser" description:"Username for database connection"`
-	DBPassword       string  `long:"dbpassword" description:"Password for database connection"`
-	DBPort           string  `long:"dbport" description:"Port for database connection"`
-	DBName           string  `long:"dbname" description:"Name of database"`
-	DcrdHost         string  `long:"dcrdhost" description:"Hostname/IP for dcrd server"`
-	DcrdUser         string  `long:"dcrduser" description:"Username for dcrd server"`
-	DcrdPassword     string  `long:"dcrdpassword" description:"Password for dcrd server"`
-	DcrdCert         string  `long:"dcrdcert" description:"Certificate path for dcrd server"`
-	WalletHost       string  `long:"wallethost" description:"Hostname for wallet server"`
-	WalletUser       string  `long:"walletuser" description:"Username for wallet server"`
-	WalletPassword   string  `long:"walletpassword" description:"Password for wallet server"`
-	WalletCert       string  `long:"walletcert" description:"Certificate path for wallet server"`
-	Version          string
+	HomeDir          string   `short:"A" long:"appdata" description:"Path to application home directory"`
+	ShowVersion      bool     `short:"V" long:"version" description:"Display version information and exit"`
+	ConfigFile       string   `short:"C" long:"configfile" description:"Path to configuration file"`
+	DataDir          string   `short:"b" long:"datadir" description:"Directory to store data"`
+	LogDir           string   `long:"logdir" description:"Directory to log output."`
+	TestNet          bool     `long:"testnet" description:"Use the test network"`
+	SimNet           bool     `long:"simnet" description:"Use the simulation test network"`
+	Profile          string   `long:"profile" description:"Deprecated: This config has no effect"`
+	CPUProfile       string   `long:"cpuprofile" description:"Deprecated: This config has no effect"`
+	MemProfile       string   `long:"memprofile" description:"Deprecated: This config has no effect"`
+	DebugLevel       string   `short:"d" long:"debuglevel" description:"Logging level for all subsystems {trace, debug, info, warn, error, critical} -- You may also specify <subsystem>=<level>,<subsystem2>=<level>,... to set the log level for individual subsystems -- Use show to list available subsystems"`
+	ColdWalletExtPub string   `long:"coldwalletextpub" description:"The extended public key for addresses to which voting service user fees are sent."`
+	PoolFees         float64  `long:"poolfees" description:"The per-ticket fees the user must send to the voting service with their tickets"`
+	DBHost           string   `long:"dbhost" description:"Hostname for database connection"`
+	DBUser           string   `long:"dbuser" description:"Username for database connection"`
+	DBPassword       string   `long:"dbpassword" description:"Password for database connection"`
+	DBPort           string   `long:"dbport" description:"Port for database connection"`
+	DBName           string   `long:"dbname" description:"Name of database"`
+	DcrdHost         string   `long:"dcrdhost" description:"Hostname/IP for dcrd server"`
+	DcrdUser         string   `long:"dcrduser" description:"Username for dcrd server"`
+	DcrdPassword     string   `long:"dcrdpassword" description:"Password for dcrd server"`
+	DcrdCert         string   `long:"dcrdcert" description:"Certificate path for dcrd server"`
+	WalletHost       string   `long:"wallethost" description:"Hostname for wallet server"`
+	WalletUser       string   `long:"walletuser" description:"Username for wallet server"`
+	WalletPassword   string   `long:"walletpassword" description:"Password for wallet server"`
+	WalletCert       string   `long:"walletcert" description:"Certificate path for wallet server"`
 	NoRPCListen      bool     `long:"norpclisten" description:"Do not start a gRPC server. User voting preferences update on a ticker"`
 	RPCListeners     []string `long:"rpclisten" description:"Add an interface/port to listen for RPC connections (default port: 9113, testnet: 19113)"`
 	RPCCert          string   `long:"rpccert" description:"File containing the certificate file"`
@@ -265,7 +264,6 @@ func loadConfig() (*config, []string, error) {
 		PoolFees:   defaultPoolFees,
 		RPCKey:     defaultRPCKeyFile,
 		RPCCert:    defaultRPCCertFile,
-		Version:    version(),
 	}
 
 	// Service options which are only added on Windows.
@@ -290,7 +288,8 @@ func loadConfig() (*config, []string, error) {
 	appName = strings.TrimSuffix(appName, filepath.Ext(appName))
 	usageMessage := fmt.Sprintf("Use %s -h to show usage", appName)
 	if preCfg.ShowVersion {
-		fmt.Println(appName, "version", version())
+		fmt.Printf("%s version %s (Go version %s %s/%s)\n", appName,
+			version.String(), runtime.Version(), runtime.GOOS, runtime.GOARCH)
 		os.Exit(0)
 	}
 
@@ -384,14 +383,14 @@ func loadConfig() (*config, []string, error) {
 	}
 
 	// Multiple networks can't be selected simultaneously.
-	numNets := 0
+	var numNets int
 
 	// Count number of network flags passed; assign active network params
 	// while we're at it
 	activeNetParams = &mainNetParams
 	if cfg.TestNet {
 		numNets++
-		activeNetParams = &testNet2Params
+		activeNetParams = &testNet3Params
 	}
 	if cfg.SimNet {
 		numNets++
@@ -465,18 +464,6 @@ func loadConfig() (*config, []string, error) {
 		err := fmt.Errorf(str, funcName)
 		fmt.Fprintln(os.Stderr, err)
 		return nil, nil, err
-	}
-
-	// Validate profile port number
-	if cfg.Profile != "" {
-		profilePort, err := strconv.Atoi(cfg.Profile)
-		if err != nil || profilePort < 1024 || profilePort > 65535 {
-			str := "%s: The profile port must be between 1024 and 65535"
-			err := fmt.Errorf(str, funcName)
-			fmt.Fprintln(os.Stderr, err)
-			fmt.Fprintln(os.Stderr, usageMessage)
-			return nil, nil, err
-		}
 	}
 
 	if len(cfg.ColdWalletExtPub) == 0 {
@@ -588,6 +575,22 @@ func loadConfig() (*config, []string, error) {
 		}
 	} else {
 		cfg.RPCListeners = normalizeAddresses(cfg.RPCListeners, activeNetParams.RPCServerPort)
+	}
+
+	// Warn about deprecated config items if they have been set
+	if cfg.Profile != "" {
+		str := "%s: Config Profile is deprecated and has no effect. Please remove from your config file"
+		log.Warnf(str, funcName)
+	}
+
+	if cfg.CPUProfile != "" {
+		str := "%s: Config CPUProfile is deprecated and has no effect. Please remove from your config file"
+		log.Warnf(str, funcName)
+	}
+
+	if cfg.MemProfile != "" {
+		str := "%s: Config MemProfile is deprecated and has no effect. Please remove from your config file"
+		log.Warnf(str, funcName)
 	}
 
 	// Warn about missing config file only after all other configuration is

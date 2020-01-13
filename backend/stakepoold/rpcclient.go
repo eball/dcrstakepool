@@ -1,20 +1,22 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"io/ioutil"
+	"sync"
 	"time"
 
 	"github.com/decred/dcrd/chaincfg/chainhash"
-	"github.com/decred/dcrd/dcrutil"
-	"github.com/decred/dcrd/rpcclient"
+	"github.com/decred/dcrd/rpcclient/v4"
+	"github.com/decred/dcrstakepool/backend/stakepoold/stakepool"
 	"github.com/decred/dcrstakepool/backend/stakepoold/userdata"
 )
 
-var requiredChainServerAPI = semver{major: 3, minor: 1, patch: 0}
-var requiredWalletAPI = semver{major: 5, minor: 0, patch: 0}
+var requiredChainServerAPI = semver{major: 6, minor: 0, patch: 0}
+var requiredWalletAPI = semver{major: 6, minor: 0, patch: 1}
 
-func connectNodeRPC(ctx *appContext, cfg *config) (*rpcclient.Client, semver, error) {
+func connectNodeRPC(spd *stakepool.Stakepoold, cfg *config) (*rpcclient.Client, semver, error) {
 	var nodeVer semver
 
 	dcrdCert, err := ioutil.ReadFile(cfg.DcrdCert)
@@ -36,7 +38,7 @@ func connectNodeRPC(ctx *appContext, cfg *config) (*rpcclient.Client, semver, er
 		Certificates: dcrdCert,
 	}
 
-	ntfnHandlers := getNodeNtfnHandlers(ctx, connCfgDaemon)
+	ntfnHandlers := getNodeNtfnHandlers(spd)
 	dcrdClient, err := rpcclient.New(connCfgDaemon, ntfnHandlers)
 	if err != nil {
 		log.Errorf("Failed to start dcrd RPC client: %s\n", err.Error())
@@ -62,7 +64,7 @@ func connectNodeRPC(ctx *appContext, cfg *config) (*rpcclient.Client, semver, er
 	return dcrdClient, nodeVer, nil
 }
 
-func connectWalletRPC(cfg *config) (*rpcclient.Client, semver, error) {
+func connectWalletRPC(ctx context.Context, wg *sync.WaitGroup, cfg *config) (*stakepool.Client, semver, error) {
 	var walletVer semver
 
 	dcrwCert, err := ioutil.ReadFile(cfg.WalletCert)
@@ -77,15 +79,18 @@ func connectWalletRPC(cfg *config) (*rpcclient.Client, semver, error) {
 		cfg.WalletHost, cfg.WalletUser, cfg.WalletCert)
 
 	connCfgWallet := &rpcclient.ConnConfig{
-		Host:         cfg.WalletHost,
-		Endpoint:     "ws",
-		User:         cfg.WalletUser,
-		Pass:         cfg.WalletPassword,
-		Certificates: dcrwCert,
+		Host:                 cfg.WalletHost,
+		Endpoint:             "ws",
+		User:                 cfg.WalletUser,
+		Pass:                 cfg.WalletPassword,
+		Certificates:         dcrwCert,
+		DisableAutoReconnect: true,
 	}
 
-	ntfnHandlers := getWalletNtfnHandlers(cfg)
-	dcrwClient, err := rpcclient.New(connCfgWallet, ntfnHandlers)
+	ntfnHandlers := getWalletNtfnHandlers()
+
+	// New also starts an autoreconnect function.
+	dcrwClient, err := stakepool.NewClient(ctx, wg, connCfgWallet, ntfnHandlers)
 	if err != nil {
 		log.Errorf("Verify that username and password is correct and that "+
 			"rpc.cert is for your wallet: %v", cfg.WalletCert)
@@ -93,7 +98,7 @@ func connectWalletRPC(cfg *config) (*rpcclient.Client, semver, error) {
 	}
 
 	// Ensure the wallet RPC server has a compatible API version.
-	ver, err := dcrwClient.Version()
+	ver, err := dcrwClient.RPCClient().Version()
 	if err != nil {
 		log.Error("Unable to get RPC version: ", err)
 		return nil, walletVer, fmt.Errorf("Unable to get node RPC version")
@@ -103,32 +108,33 @@ func connectWalletRPC(cfg *config) (*rpcclient.Client, semver, error) {
 	walletVer = semver{dcrwVer.Major, dcrwVer.Minor, dcrwVer.Patch}
 
 	if !semverCompatible(requiredWalletAPI, walletVer) {
-		log.Warnf("Node JSON-RPC server %v does not have "+
+		log.Errorf("Node JSON-RPC server %v does not have "+
 			"a compatible API version. Advertizes %v but require %v",
 			cfg.WalletHost, walletVer, requiredWalletAPI)
+		return nil, walletVer, fmt.Errorf("Incompatible dcrwallet RPC version")
 	}
 
 	return dcrwClient, walletVer, nil
 }
 
-func walletGetTickets(ctx *appContext, currentHeight int64) (map[chainhash.Hash]string, map[chainhash.Hash]string, error) {
+func walletGetTickets(spd *stakepool.Stakepoold) (map[chainhash.Hash]string, map[chainhash.Hash]string, error) {
 	blockHashToHeightCache := make(map[chainhash.Hash]int32)
 
 	// This is suboptimal to copy and needs fixing.
 	userVotingConfig := make(map[string]userdata.UserVotingConfig)
-	ctx.RLock()
-	for k, v := range ctx.userVotingConfig {
+	spd.RLock()
+	for k, v := range spd.UserVotingConfig {
 		userVotingConfig[k] = v
 	}
-	ctx.RUnlock()
+	spd.RUnlock()
 
 	ignoredLowFeeTickets := make(map[chainhash.Hash]string)
 	liveTickets := make(map[chainhash.Hash]string)
-	normalFee := 0
+	var normalFee int
 
 	log.Info("Calling GetTickets...")
 	timenow := time.Now()
-	tickets, err := ctx.walletConnection.GetTickets(false)
+	tickets, err := spd.WalletConnection.RPCClient().GetTickets(false)
 	log.Infof("GetTickets: took %v", time.Since(timenow))
 
 	if err != nil {
@@ -144,10 +150,10 @@ func walletGetTickets(ctx *appContext, currentHeight int64) (map[chainhash.Hash]
 	log.Debugf("setting up GetTransactionAsync for %v tickets", len(tickets))
 	for _, ticket := range tickets {
 		// lookup ownership of each ticket
-		promises = append(promises, promise{ctx.walletConnection.GetTransactionAsync(ticket)})
+		promises = append(promises, promise{spd.WalletConnection.RPCClient().GetTransactionAsync(ticket)})
 	}
 
-	counter := 0
+	var counter int
 	for _, p := range promises {
 		counter++
 		log.Debugf("Receiving GetTransaction result for ticket %v/%v", counter, len(tickets))
@@ -158,15 +164,10 @@ func walletGetTickets(ctx *appContext, currentHeight int64) (map[chainhash.Hash]
 			continue
 		}
 		for i := range gt.Details {
-			_, ok := userVotingConfig[gt.Details[i].Address]
+			addr := gt.Details[i].Address
+			_, ok := userVotingConfig[addr]
 			if !ok {
-				log.Warnf("Could not map ticket %v to a user, user %v doesn't exist", gt.TxID, gt.Details[i].Address)
-				continue
-			}
-
-			addr, err := dcrutil.DecodeAddress(gt.Details[i].Address)
-			if err != nil {
-				log.Warnf("invalid address %v", err)
+				log.Warnf("Could not map ticket %v to a user, user %v doesn't exist", gt.TxID, addr)
 				continue
 			}
 
@@ -179,14 +180,13 @@ func walletGetTickets(ctx *appContext, currentHeight int64) (map[chainhash.Hash]
 			// All tickets are present in the GetTickets response, whether they
 			// pay the correct fee or not.  So we need to verify fees and
 			// sort the tickets into their respective maps.
-			_, isAdded := ctx.addedLowFeeTicketsMSA[*hash]
+			_, isAdded := spd.AddedLowFeeTicketsMSA[*hash]
 			if isAdded {
-				liveTickets[*hash] = userVotingConfig[gt.Details[i].Address].MultiSigAddress
+				liveTickets[*hash] = userVotingConfig[addr].MultiSigAddress
 			} else {
-
-				msgTx := MsgTxFromHex(gt.Hex)
-				if msgTx == nil {
-					log.Warnf("MsgTxFromHex failed for %v", gt.Hex)
+				msgTx, err := stakepool.MsgTxFromHex(gt.Hex)
+				if err != nil {
+					log.Warnf("MsgTxFromHex failed for %v: %v", gt.Hex, err)
 					continue
 				}
 
@@ -202,7 +202,7 @@ func walletGetTickets(ctx *appContext, currentHeight int64) (map[chainhash.Hash]
 				if inCache {
 					ticketBlockHeight = height
 				} else {
-					gbh, err := ctx.nodeConnection.GetBlockHeader(ticketBlockHash)
+					gbh, err := spd.NodeConnection.GetBlockHeader(ticketBlockHash)
 					if err != nil {
 						log.Warnf("GetBlockHeader failed for %v: %v", ticketBlockHash, err)
 						continue
@@ -212,14 +212,19 @@ func walletGetTickets(ctx *appContext, currentHeight int64) (map[chainhash.Hash]
 					ticketBlockHeight = int32(gbh.Height)
 				}
 
-				ticketFeesValid, err := evaluateStakePoolTicket(ctx, msgTx, ticketBlockHeight, addr)
-				if ticketFeesValid {
+				ticketFeesValid, err := spd.EvaluateStakePoolTicket(msgTx, ticketBlockHeight)
+
+				if err != nil {
+					log.Warnf("ignoring ticket %v for multisig %v due to error: %v",
+						*hash, spd.UserVotingConfig[addr].MultiSigAddress, err)
+					ignoredLowFeeTickets[*hash] = userVotingConfig[addr].MultiSigAddress
+				} else if ticketFeesValid {
 					normalFee++
-					liveTickets[*hash] = userVotingConfig[gt.Details[i].Address].MultiSigAddress
+					liveTickets[*hash] = userVotingConfig[addr].MultiSigAddress
 				} else {
-					ignoredLowFeeTickets[*hash] = userVotingConfig[gt.Details[i].Address].MultiSigAddress
-					log.Warnf("ignoring ticket %v for msa %v ticketFeesValid %v err %v",
-						*hash, ctx.userVotingConfig[gt.Details[i].Address].MultiSigAddress, ticketFeesValid, err)
+					log.Warnf("ignoring ticket %v for multisig %v due to invalid fee",
+						*hash, spd.UserVotingConfig[addr].MultiSigAddress)
+					ignoredLowFeeTickets[*hash] = userVotingConfig[addr].MultiSigAddress
 				}
 			}
 			break
@@ -227,7 +232,7 @@ func walletGetTickets(ctx *appContext, currentHeight int64) (map[chainhash.Hash]
 	}
 
 	log.Infof("tickets loaded -- addedLowFee %v ignoredLowFee %v normalFee %v "+
-		"live %v total %v", len(ctx.addedLowFeeTicketsMSA),
+		"live %v total %v", len(spd.AddedLowFeeTicketsMSA),
 		len(ignoredLowFeeTickets), normalFee, len(liveTickets),
 		len(tickets))
 

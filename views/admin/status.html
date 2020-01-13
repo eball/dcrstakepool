@@ -1,74 +1,71 @@
 {{define "admin/status"}}
-<div class="wrapper">
- <div class="row">
+<section class="site-content">
+	<div class="container container--narrow">
 
-  <div class="col-xs-15 col-md-8 col-lg-8 notication-col center-block">
-    {{if .Error}}<div class="well well-notification  orange-notification">{{.Error}}</div>{{end}}
-    {{range .Flash}}<div class="well well-notification  orange-notification">{{.}}</div>{{end}}
-    {{range .FlashWarn}}<div class="well well-notification  orange-notification">{{.}}</div>{{end}}
-  </div>
- 
-  <div class="col-sm-15 col-md-10 text-left center-block">
+		<div class="row mx-3">
+			<section class="block">
+				
+				<div class="col-12 block__title">
+					<h1 class="d-flex justify-content-between align-items-center">
+						<span>Back-end Status</span>
+					</h1>
+				</div>
 
-	<div class="panel panel-default panel-control">
-		<div class="panel-heading">
-			<h4 class="panel-title">Status</h4>
+
+				<div class="col-12 mb-3 px-0">
+					<div class="table-scroll-y table-responsive text-nowrap">
+						<table class="table" cellspacing="0" width="100%">
+							<thead class="thead-light">
+								<tr>
+									<th scope="col" class="text-center">Host</th>
+									<th scope="col" class="text-center">Stakepoold RPC Status</th>
+									<th scope="col" class="text-center">DaemonConnected</th>
+									<th scope="col" class="text-center">Unlocked</th>
+									<th scope="col" class="text-center">Voting</th>
+									<th scope="col" class="text-center">VoteVersion</th>
+								</tr>
+							</thead>
+							<tbody>
+								{{ range .BackendStatus }}
+								<tr class="table-light">
+									<td class="text-center">{{ .Host }}</td>
+									
+									<td class="text-center
+										{{ if eq .RPCStatus "Ready" }}status-good{{else}}status-bad{{end}}"
+										>{{ .RPCStatus }}</td>
+
+									{{ with .WalletStatus }}
+									
+										<td class="text-center
+											{{ if eq .DaemonConnected true }}status-good{{else}}status-bad{{end}}"
+											>{{ .DaemonConnected }}</td>
+
+										
+										<td class="text-center
+											{{ if eq .Unlocked true }}status-good{{else}}status-bad{{end}}"
+											>{{ .Unlocked }}</td>
+
+										
+										<td class="text-center
+											{{ if eq .Voting false }}status-good{{else}}status-bad{{end}}"
+											>{{ .Voting }}</td>
+
+										<td class="text-center">{{ .VoteVersion }}</td>
+
+									{{else}}
+									
+										<td class="text-center status-bad" colspan="4">Cannot get wallet stats</td>
+									
+									{{end}}
+								</tr>
+								{{end}}
+							</tbody>
+						</table>
+					</div>
+				</div>
+
+			</section>
 		</div>
-		<div class="panel-body">
-			{{if .StakepooldInfo}}
-			<table id="stakepooldinfo" class="table table-condensed datatablesort responsive">
-				<thead>
-					<tr>
-						<th>Stakepoold Number</th>
-						<th>GRPC Connection Status</th>
-					</tr>
-				</thead>
-				<tbody>
-				{{ range $i, $data := .StakepooldInfo }}
-					<tr>
-						<td>{{$i}}</td>
-						<td>{{ $data.Status }}</td>
-					</tr>
-				{{end}}
-				</tbody>
-			</table>
-			{{end}}
-			{{if not .WalletInfo}}
-			<p><span style="font-size: larger;"><b>Error receiving walletinfo</b></span></p>
-			{{end}}
-			{{if .WalletInfo}}
-			<table id="walletinfo" class="table table-condensed datatablesort responsive">
-				<thead>
-					<tr>
-						<th>Wallet Number</th>
-						<th>Connected</th>
-						<th>DaemonConnected</th>
-						<th>EnableVoting</th>
-					</tr>
-				</thead>
-				<tbody>
-				{{ range $i, $data := .WalletInfo }}
-					<tr>
-						{{ if $data.Connected }}
-						<td>{{$i}}</td>
-						<td>{{ $data.Connected }}</td>
-						<td>{{ $data.DaemonConnected }}</td>
-						<td>{{ $data.EnableVoting }}</td> 
-						{{else}}
-						<td>{{$i}}</td>
-						<td>{{ $data.Connected }}</td>
-						<td></td>
-						<td></td>
-						{{end}}
-					</tr>
-				{{end}}
-				</tbody>
-			</table>
-			{{end}}
-			<p>RPC Status: {{ .RPCStatus }}
-		</div><!-- panel-body -->
-	</div><!-- panel-default -->
-  </div><!-- center-block -->
-</div><!-- row -->
-</div><!-- wrapper -->
+	</div>
+</section>
 {{end}}

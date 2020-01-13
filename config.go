@@ -1,55 +1,59 @@
 // Copyright (c) 2013-2014 The btcsuite developers
-// Copyright (c) 2015-2016 The Decred developers
+// Copyright (c) 2015-2019 The Decred developers
 // Use of this source code is governed by an ISC
 // license that can be found in the LICENSE file.
 
 package main
 
 import (
+	"crypto/x509"
+	"encoding/pem"
 	"fmt"
+	"io/ioutil"
 	"net"
 	"os"
 	"path/filepath"
 	"runtime"
 	"sort"
-	"strconv"
 	"strings"
 
-	flags "github.com/btcsuite/go-flags"
-	"github.com/decred/dcrd/dcrutil"
+	"github.com/decred/dcrd/chaincfg/v2"
+	"github.com/decred/dcrd/dcrutil/v2"
+	"github.com/decred/dcrd/hdkeychain/v2"
+	"github.com/decred/dcrstakepool/internal/version"
+	flags "github.com/jessevdk/go-flags"
 )
 
 const (
-	defaultBaseURL          = "http://127.0.0.1:8000"
-	defaultClosePoolMsg     = "The stake pool is temporarily closed to new signups."
-	defaultConfigFilename   = "dcrstakepool.conf"
-	defaultDataDirname      = "data"
-	defaultLogLevel         = "info"
-	defaultLogDirname       = "logs"
-	defaultLogFilename      = "dcrstakepool.log"
-	defaultCookieSecure     = false
-	defaultDBHost           = "localhost"
-	defaultDBName           = "stakepool"
-	defaultDBPort           = "3306"
-	defaultDBUser           = "stakepool"
-	defaultListen           = ":8000"
-	defaultPoolEmail        = "admin@example.com"
-	defaultPoolFees         = 7.5
-	defaultPoolLink         = "https://forum.decred.org/threads/rfp-6-setup-and-operate-10-stake-pools.1361/"
-	defaultPublicPath       = "public"
-	defaultTemplatePath     = "views"
-	defaultRecaptchaSecret  = "6LeIxAcTAAAAAGG-vFI1TnRWxMZNFuojJ4WifJWe"
-	defaultRecaptchaSitekey = "6LeIxAcTAAAAAJcZVRqyHh71UMIEGNQ_MXjiZKhI"
-	defaultSMTPHost         = ""
-	defaultMinServers       = 2
-	defaultMaxVotedAge      = 8640
+	defaultBaseURL         = "http://127.0.0.1:8000"
+	defaultClosePoolMsg    = "The voting service is temporarily closed to new signups."
+	defaultConfigFilename  = "dcrstakepool.conf"
+	defaultLogLevel        = "info"
+	defaultLogDirname      = "logs"
+	defaultLogFilename     = "dcrstakepool.log"
+	defaultCookieSecure    = false
+	defaultDBHost          = "localhost"
+	defaultDBName          = "stakepool"
+	defaultDBPort          = "3306"
+	defaultDBUser          = "stakepool"
+	defaultListen          = ":8000"
+	defaultPoolEmail       = "admin@example.com"
+	defaultPoolFees        = 7.5
+	defaultPoolLink        = "https://forum.decred.org/threads/rfp-6-setup-and-operate-10-stake-pools.1361/"
+	defaultPublicPath      = "public"
+	defaultTemplatePath    = "views"
+	defaultSMTPHost        = ""
+	defaultMaxVotedTickets = 1000
+	defaultDescription     = ""
+	defaultDesignation     = ""
 )
 
 var (
 	dcrstakepoolHomeDir = dcrutil.AppDataDir("dcrstakepool", false)
 	defaultConfigFile   = filepath.Join(dcrstakepoolHomeDir, defaultConfigFilename)
-	defaultDataDir      = filepath.Join(dcrstakepoolHomeDir, defaultDataDirname)
 	defaultLogDir       = filepath.Join(dcrstakepoolHomeDir, defaultLogDirname)
+	coldWalletFeeKey    *hdkeychain.ExtendedKey
+	votingWalletVoteKey *hdkeychain.ExtendedKey
 )
 
 // runServiceCommand is only set to a real function on Windows.  It is used
@@ -60,54 +64,50 @@ var runServiceCommand func(string) error
 //
 // See loadConfig for details on the configuration load process.
 type config struct {
-	ShowVersion        bool     `short:"V" long:"version" description:"Display version information and exit"`
-	ConfigFile         string   `short:"C" long:"configfile" description:"Path to configuration file"`
-	DataDir            string   `short:"b" long:"datadir" description:"Directory to store data"`
-	LogDir             string   `long:"logdir" description:"Directory to log output."`
-	Listen             string   `long:"listen" description:"Listen for connections on the specified interface/port (default all interfaces port: 9113, testnet: 19113)"`
-	TestNet            bool     `long:"testnet" description:"Use the test network"`
-	SimNet             bool     `long:"simnet" description:"Use the simulation test network"`
-	Profile            string   `long:"profile" description:"Enable HTTP profiling on given port -- NOTE port must be between 1024 and 65536"`
-	CPUProfile         string   `long:"cpuprofile" description:"Write CPU profile to the specified file"`
-	MemProfile         string   `long:"memprofile" description:"Write mem profile to the specified file"`
-	DebugLevel         string   `short:"d" long:"debuglevel" description:"Logging level for all subsystems {trace, debug, info, warn, error, critical} -- You may also specify <subsystem>=<level>,<subsystem2>=<level>,... to set the log level for individual subsystems -- Use show to list available subsystems"`
-	APISecret          string   `long:"apisecret" description:"Secret string used to encrypt API tokens."`
-	BaseURL            string   `long:"baseurl" description:"BaseURL to use when sending links via email"`
-	ColdWalletExtPub   string   `long:"coldwalletextpub" description:"The extended public key to send user stake pool fees to"`
-	ClosePool          bool     `long:"closepool" description:"Disable user registration actions (sign-ups and submitting addresses)"`
-	ClosePoolMsg       string   `long:"closepoolmsg" description:"Message to display when closepool is set (default: Stake pool is currently oversubscribed)"`
-	CookieSecret       string   `long:"cookiesecret" description:"Secret string used to encrypt session data."`
-	CookieSecure       bool     `long:"cookiesecure" description:"Set whether cookies can be sent in clear text or not."`
-	DBHost             string   `long:"dbhost" description:"Hostname for database connection"`
-	DBUser             string   `long:"dbuser" description:"Username for database connection"`
-	DBPassword         string   `long:"dbpassword" description:"Password for database connection"`
-	DBPort             string   `long:"dbport" description:"Port for database connection"`
-	DBName             string   `long:"dbname" description:"Name of database"`
-	PublicPath         string   `long:"publicpath" description:"Path to the public folder which contains css/fonts/images/javascript."`
-	TemplatePath       string   `long:"templatepath" description:"Path to the views folder which contains html files."`
-	RecaptchaSecret    string   `long:"recaptchasecret" description:"Recaptcha Secret"`
-	RecaptchaSitekey   string   `long:"recaptchasitekey" description:"Recaptcha Sitekey"`
-	PoolEmail          string   `long:"poolemail" description:"Email address to for support inquiries"`
-	PoolFees           float64  `long:"poolfees" description:"The per-ticket fees the user must send to the pool with their tickets"`
-	PoolLink           string   `long:"poollink" description:"URL for support inquiries such as forum, IRC, etc"`
-	RealIPHeader       string   `long:"realipheader" description:"The name of an HTTP request header containing the actual remote client IP address, typically set by a reverse proxy. An empty string (default) indicates to use net/Request.RemodeAddr."`
-	SMTPFrom           string   `long:"smtpfrom" description:"From address to use on outbound mail"`
-	SMTPHost           string   `long:"smtphost" description:"SMTP hostname/ip and port, e.g. mail.example.com:25"`
-	SMTPUsername       string   `long:"smtpusername" description:"SMTP username for authentication if required"`
-	SMTPPassword       string   `long:"smtppassword" description:"SMTP password for authentication if required"`
+	ShowVersion        bool    `short:"V" long:"version" description:"Display version information and exit"`
+	ConfigFile         string  `short:"C" long:"configfile" description:"Path to configuration file"`
+	LogDir             string  `long:"logdir" description:"Directory to log output."`
+	Listen             string  `long:"listen" description:"Listen for connections on the specified interface/port (default all interfaces port: 9113, testnet: 19113)"`
+	TestNet            bool    `long:"testnet" description:"Use the test network"`
+	SimNet             bool    `long:"simnet" description:"Use the simulation test network"`
+	Profile            string  `long:"profile" description:"Deprecated: This config has no effect"`
+	CPUProfile         string  `long:"cpuprofile" description:"Deprecated: This config has no effect"`
+	MemProfile         string  `long:"memprofile" description:"Deprecated: This config has no effect"`
+	DebugLevel         string  `short:"d" long:"debuglevel" description:"Logging level for all subsystems {trace, debug, info, warn, error, critical} -- You may also specify <subsystem>=<level>,<subsystem2>=<level>,... to set the log level for individual subsystems -- Use show to list available subsystems"`
+	APISecret          string  `long:"apisecret" description:"Secret string used to encrypt API tokens."`
+	BaseURL            string  `long:"baseurl" description:"BaseURL to use when sending links via email"`
+	ColdWalletExtPub   string  `long:"coldwalletextpub" description:"The extended public key for addresses to which voting service user fees are sent."`
+	ClosePool          bool    `long:"closepool" description:"Disable user registration actions (sign-ups and submitting addresses)"`
+	ClosePoolMsg       string  `long:"closepoolmsg" description:"Message to display when closepool is set."`
+	CookieSecret       string  `long:"cookiesecret" description:"Secret string used to encrypt session data."`
+	CookieSecure       bool    `long:"cookiesecure" description:"Set whether cookies can be sent in clear text or not."`
+	DBHost             string  `long:"dbhost" description:"Hostname for database connection"`
+	DBUser             string  `long:"dbuser" description:"Username for database connection"`
+	DBPassword         string  `long:"dbpassword" description:"Password for database connection"`
+	DBPort             string  `long:"dbport" description:"Port for database connection"`
+	DBName             string  `long:"dbname" description:"Name of database"`
+	PublicPath         string  `long:"publicpath" description:"Path to the public folder which contains css/fonts/images/javascript."`
+	TemplatePath       string  `long:"templatepath" description:"Path to the views folder which contains html files."`
+	PoolEmail          string  `long:"poolemail" description:"Email address to for support inquiries"`
+	PoolFees           float64 `long:"poolfees" description:"The per-ticket fees the user must send to the pool with their tickets"`
+	PoolLink           string  `long:"poollink" description:"URL for support inquiries such as forum, IRC, etc"`
+	RealIPHeader       string  `long:"realipheader" description:"The name of an HTTP request header containing the actual remote client IP address, typically set by a reverse proxy. An empty string (default) indicates to use net/Request.RemodeAddr."`
+	SMTPFrom           string  `long:"smtpfrom" description:"From address to use on outbound mail"`
+	SMTPHost           string  `long:"smtphost" description:"SMTP hostname/ip and port, e.g. mail.example.com:25"`
+	SMTPUsername       string  `long:"smtpusername" description:"SMTP username for authentication if required"`
+	SMTPPassword       string  `long:"smtppassword" description:"SMTP password for authentication if required"`
+	UseSMTPS           bool    `long:"usesmtps" description:"Connect to the SMTP server using smtps."`
+	SMTPSkipVerify     bool    `long:"smtpskipverify" description:"Skip SMTP TLS cert verification. Will only skip if SMTPCert is empty"`
+	SMTPCert           string  `long:"smtpcert" description:"Path for the smtp certificate file"`
+	SystemCerts        *x509.CertPool
 	StakepooldHosts    []string `long:"stakepooldhosts" description:"Hostnames for stakepoold servers"`
 	StakepooldCerts    []string `long:"stakepooldcerts" description:"Certificate paths for stakepoold servers"`
-	WalletHosts        []string `long:"wallethosts" description:"Hostnames for wallet servers"`
-	WalletUsers        []string `long:"walletusers" description:"Usernames for wallet servers"`
-	WalletPasswords    []string `long:"walletpasswords" description:"Passwords for wallet servers"`
-	WalletCerts        []string `long:"walletcerts" description:"Certificate paths for wallet servers"`
-	Version            string
 	VotingWalletExtPub string   `long:"votingwalletextpub" description:"The extended public key of the default account of the voting wallet"`
 	AdminIPs           []string `long:"adminips" description:"Expected admin host"`
 	AdminUserIDs       []string `long:"adminuserids" description:"User IDs of users who are allowed to access administrative functions."`
-	MinServers         int      `long:"minservers" description:"Minimum number of wallets connected needed to avoid errors"`
-	EnableStakepoold   bool     `long:"enablestakepoold" description:"Enable communication with stakepoold"`
-	MaxVotedAge        int64    `long:"maxvotedage" description:"Maximum vote age (blocks since vote) to include in voted tickets table"`
+	MaxVotedTickets    int      `long:"maxvotedtickets" description:"Maximum number of voted tickets to show on tickets page."`
+	Description        string   `long:"description" description:"Operators own description of their VSP"`
+	Designation        string   `long:"designation" description:"VSP designation (eg. Alpha, Bravo, etc)"`
 }
 
 // serviceOptions defines the configuration options for the daemon as a service
@@ -258,6 +258,22 @@ func fileExists(name string) bool {
 	return true
 }
 
+// validate pub vote and fee keys as belonging to the network
+func (c *config) parsePubKeys(params *chaincfg.Params) error {
+	// Parse the extended public key and the pool fees.
+	var err error
+	coldWalletFeeKey, err = hdkeychain.NewKeyFromString(c.ColdWalletExtPub, params)
+	if err != nil {
+		return fmt.Errorf("cold wallet extended public key: %v", err)
+	}
+	// Parse the extended public key for the voting addresses.
+	votingWalletVoteKey, err = hdkeychain.NewKeyFromString(c.VotingWalletExtPub, params)
+	if err != nil {
+		return fmt.Errorf("voting wallet extended public key: %v", err)
+	}
+	return nil
+}
+
 // newConfigParser returns a new command line flags parser.
 func newConfigParser(cfg *config, so *serviceOptions, options flags.Options) *flags.Parser {
 	parser := flags.NewParser(cfg, options)
@@ -282,30 +298,27 @@ func newConfigParser(cfg *config, so *serviceOptions, options flags.Options) *fl
 func loadConfig() (*config, []string, error) {
 	// Default config.
 	cfg := config{
-		BaseURL:          defaultBaseURL,
-		ClosePool:        false,
-		ClosePoolMsg:     defaultClosePoolMsg,
-		ConfigFile:       defaultConfigFile,
-		DebugLevel:       defaultLogLevel,
-		DataDir:          defaultDataDir,
-		LogDir:           defaultLogDir,
-		CookieSecure:     defaultCookieSecure,
-		DBHost:           defaultDBHost,
-		DBName:           defaultDBName,
-		DBPort:           defaultDBPort,
-		DBUser:           defaultDBUser,
-		Listen:           defaultListen,
-		PoolEmail:        defaultPoolEmail,
-		PoolFees:         defaultPoolFees,
-		PoolLink:         defaultPoolLink,
-		PublicPath:       defaultPublicPath,
-		TemplatePath:     defaultTemplatePath,
-		RecaptchaSecret:  defaultRecaptchaSecret,
-		RecaptchaSitekey: defaultRecaptchaSitekey,
-		SMTPHost:         defaultSMTPHost,
-		Version:          version(),
-		MinServers:       defaultMinServers,
-		MaxVotedAge:      defaultMaxVotedAge,
+		BaseURL:         defaultBaseURL,
+		ClosePool:       false,
+		ClosePoolMsg:    defaultClosePoolMsg,
+		ConfigFile:      defaultConfigFile,
+		DebugLevel:      defaultLogLevel,
+		LogDir:          defaultLogDir,
+		CookieSecure:    defaultCookieSecure,
+		DBHost:          defaultDBHost,
+		DBName:          defaultDBName,
+		DBPort:          defaultDBPort,
+		DBUser:          defaultDBUser,
+		Listen:          defaultListen,
+		PoolEmail:       defaultPoolEmail,
+		PoolFees:        defaultPoolFees,
+		PoolLink:        defaultPoolLink,
+		PublicPath:      defaultPublicPath,
+		TemplatePath:    defaultTemplatePath,
+		SMTPHost:        defaultSMTPHost,
+		MaxVotedTickets: defaultMaxVotedTickets,
+		Description:     defaultDescription,
+		Designation:     defaultDesignation,
 	}
 
 	// Service options which are only added on Windows.
@@ -330,7 +343,8 @@ func loadConfig() (*config, []string, error) {
 	appName = strings.TrimSuffix(appName, filepath.Ext(appName))
 	usageMessage := fmt.Sprintf("Use %s -h to show usage", appName)
 	if preCfg.ShowVersion {
-		fmt.Println(appName, "version", version())
+		fmt.Printf("%s version %s (Go version %s %s/%s)\n", appName,
+			version.String(), runtime.Version(), runtime.GOOS, runtime.GOARCH)
 		os.Exit(0)
 	}
 
@@ -348,9 +362,7 @@ func loadConfig() (*config, []string, error) {
 	// Load additional config from file.
 	var configFileError error
 	parser := newConfigParser(&cfg, &serviceOpts, flags.Default)
-	if !(preCfg.SimNet) || preCfg.ConfigFile !=
-		defaultConfigFile {
-
+	if !(preCfg.SimNet) || preCfg.ConfigFile != defaultConfigFile {
 		err := flags.NewIniParser(parser).ParseFile(preCfg.ConfigFile)
 		if err != nil {
 			if _, ok := err.(*os.PathError); !ok {
@@ -393,19 +405,21 @@ func loadConfig() (*config, []string, error) {
 	}
 
 	// Multiple networks can't be selected simultaneously.
-	numNets := 0
+	var numNets int
 
-	// Count number of network flags passed; assign active network params
-	// while we're at it
+	// Assign active network params and min required backend servers
+	var minRequiredBackendServers = 2
 	activeNetParams = &mainNetParams
 	if cfg.TestNet {
 		numNets++
-		activeNetParams = &testNet2Params
+		activeNetParams = &testNet3Params
+		minRequiredBackendServers = 1
 	}
 	if cfg.SimNet {
 		numNets++
 		// Also disable dns seeding on the simulation test network.
 		activeNetParams = &simNetParams
+		minRequiredBackendServers = 1
 	}
 	if numNets > 1 {
 		str := "%s: The testnet and simnet params can't be " +
@@ -415,15 +429,6 @@ func loadConfig() (*config, []string, error) {
 		fmt.Fprintln(os.Stderr, usageMessage)
 		return nil, nil, err
 	}
-
-	// Append the network type to the data directory so it is "namespaced"
-	// per network.  In addition to the block database, there are other
-	// pieces of data that are saved to disk such as address manager state.
-	// All data is specific to a network, so namespacing the data directory
-	// means each individual piece of serialized data does not have to
-	// worry about changing names per network and such.
-	cfg.DataDir = cleanAndExpandPath(cfg.DataDir)
-	cfg.DataDir = filepath.Join(cfg.DataDir, netName(activeNetParams))
 
 	// Append the network type to the log directory so it is "namespaced"
 	// per network in the same fashion as the data directory.
@@ -446,18 +451,6 @@ func loadConfig() (*config, []string, error) {
 		fmt.Fprintln(os.Stderr, err)
 		fmt.Fprintln(os.Stderr, usageMessage)
 		return nil, nil, err
-	}
-
-	// Validate profile port number
-	if cfg.Profile != "" {
-		profilePort, err := strconv.Atoi(cfg.Profile)
-		if err != nil || profilePort < 1024 || profilePort > 65535 {
-			str := "%s: The profile port must be between 1024 and 65535"
-			err := fmt.Errorf(str, funcName)
-			fmt.Fprintln(os.Stderr, err)
-			fmt.Fprintln(os.Stderr, usageMessage)
-			return nil, nil, err
-		}
 	}
 
 	if cfg.APISecret == "" {
@@ -509,141 +502,110 @@ func loadConfig() (*config, []string, error) {
 		return nil, nil, err
 	}
 
-	if len(cfg.WalletHosts) == 0 {
-		str := "%s: wallethosts is not set in config"
-		err := fmt.Errorf(str, funcName)
-		fmt.Fprintln(os.Stderr, err)
-		return nil, nil, err
-	}
-
-	if len(cfg.WalletCerts) == 0 {
-		str := "%s: walletcerts is not set in config"
-		err := fmt.Errorf(str, funcName)
-		fmt.Fprintln(os.Stderr, err)
-		return nil, nil, err
-	}
-
-	if len(cfg.WalletUsers) == 0 {
-		str := "%s: walletusers is not set in config"
-		err := fmt.Errorf(str, funcName)
-		fmt.Fprintln(os.Stderr, err)
-		return nil, nil, err
-	}
-
-	if len(cfg.WalletPasswords) == 0 {
-		str := "%s: walletpasswords is not set in config"
-		err := fmt.Errorf(str, funcName)
+	if err := cfg.parsePubKeys(activeNetParams.Params); err != nil {
+		err := fmt.Errorf("%s: failed to parse extended public keys: %v", funcName, err)
 		fmt.Fprintln(os.Stderr, err)
 		return nil, nil, err
 	}
 
 	// Convert comma separated list into a slice
 	cfg.AdminIPs = strings.Split(cfg.AdminIPs[0], ",")
-	cfg.WalletHosts = strings.Split(cfg.WalletHosts[0], ",")
-	cfg.WalletUsers = strings.Split(cfg.WalletUsers[0], ",")
-	cfg.WalletPasswords = strings.Split(cfg.WalletPasswords[0], ",")
-	cfg.WalletCerts = strings.Split(cfg.WalletCerts[0], ",")
+	cfg.AdminUserIDs = strings.Split(cfg.AdminUserIDs[0], ",")
 
-	// Add default wallet port for the active network if there's no port specified
-	cfg.WalletHosts = normalizeAddresses(cfg.WalletHosts, activeNetParams.WalletRPCServerPort)
-
-	if len(cfg.WalletHosts) < 2 {
-		str := "%s: you must specify at least 2 wallethosts"
+	if len(cfg.StakepooldHosts) == 0 {
+		str := "%s: stakepooldhosts is not set in config"
 		err := fmt.Errorf(str, funcName)
 		fmt.Fprintln(os.Stderr, err)
 		return nil, nil, err
 	}
 
-	if len(cfg.WalletHosts) != len(cfg.WalletUsers) {
-		str := "%s: wallet configuration mismatch (walletusers and wallethosts counts differ)"
+	if len(cfg.StakepooldCerts) == 0 {
+		str := "%s: stakepooldcerts is not set in config"
 		err := fmt.Errorf(str, funcName)
 		fmt.Fprintln(os.Stderr, err)
 		return nil, nil, err
 	}
 
-	if len(cfg.WalletHosts) != len(cfg.WalletPasswords) {
-		str := "%s: wallet configuration mismatch (walletpasswords and wallethosts counts differ)"
+	cfg.StakepooldHosts = strings.Split(cfg.StakepooldHosts[0], ",")
+	cfg.StakepooldCerts = strings.Split(cfg.StakepooldCerts[0], ",")
+
+	// Add default stakepoold port for the active network if there's
+	// no port specified
+	cfg.StakepooldHosts = normalizeAddresses(cfg.StakepooldHosts,
+		activeNetParams.StakepooldRPCServerPort)
+	if len(cfg.StakepooldHosts) < minRequiredBackendServers {
+		str := "%s: you must specify at least %d stakepooldhosts"
+		err := fmt.Errorf(str, funcName, minRequiredBackendServers)
+		fmt.Fprintln(os.Stderr, err)
+		return nil, nil, err
+	}
+
+	if len(cfg.StakepooldHosts) != len(cfg.StakepooldCerts) {
+		str := "%s: wallet configuration mismatch " +
+			"(stakepooldcerts and stakepooldhosts " +
+			"counts differ)"
 		err := fmt.Errorf(str, funcName)
 		fmt.Fprintln(os.Stderr, err)
 		return nil, nil, err
 	}
 
-	if len(cfg.WalletHosts) != len(cfg.WalletCerts) {
-		str := "%s: wallet configuration mismatch (walletcerts and wallethosts counts differ)"
-		err := fmt.Errorf(str, funcName)
-		fmt.Fprintln(os.Stderr, err)
-		return nil, nil, err
-	}
-
-	for idx := range cfg.WalletCerts {
-		if !fileExists(cfg.WalletCerts[idx]) {
-			path := filepath.Join(dcrstakepoolHomeDir, cfg.WalletCerts[idx])
+	for idx := range cfg.StakepooldCerts {
+		if !fileExists(cfg.StakepooldCerts[idx]) {
+			path := filepath.Join(dcrstakepoolHomeDir,
+				cfg.StakepooldCerts[idx])
 			if !fileExists(path) {
-				str := "%s: walletcert " + cfg.WalletCerts[idx] + " and " +
-					path + " don't exist"
+				str := "%s: stakepooldcert " +
+					cfg.StakepooldCerts[idx] +
+					" and " + path + " don't exist"
 				err := fmt.Errorf(str, funcName)
 				fmt.Fprintln(os.Stderr, err)
 				return nil, nil, err
 			}
 
-			cfg.WalletCerts[idx] = path
+			cfg.StakepooldCerts[idx] = path
 		}
 	}
 
-	if cfg.EnableStakepoold {
-		if len(cfg.StakepooldHosts) == 0 {
-			str := "%s: stakepooldhosts is not set in config"
-			err := fmt.Errorf(str, funcName)
-			fmt.Fprintln(os.Stderr, err)
-			return nil, nil, err
+	// Validate smtp root cert.
+	if cfg.SMTPCert != "" {
+		cfg.SMTPCert = cleanAndExpandPath(cfg.SMTPCert)
+
+		b, err := ioutil.ReadFile(cfg.SMTPCert)
+		if err != nil {
+			return nil, nil, fmt.Errorf("read smtpcert: %v", err)
 		}
-
-		if len(cfg.StakepooldCerts) == 0 {
-			str := "%s: stakepooldcerts is not set in config"
-			err := fmt.Errorf(str, funcName)
-			fmt.Fprintln(os.Stderr, err)
-			return nil, nil, err
+		block, _ := pem.Decode(b)
+		cert, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			return nil, nil, fmt.Errorf("parse smtpcert: %v", err)
 		}
-
-		cfg.StakepooldHosts = strings.Split(cfg.StakepooldHosts[0], ",")
-		cfg.StakepooldCerts = strings.Split(cfg.StakepooldCerts[0], ",")
-
-		// Add default stakepoold port for the active network if there's
-		// no port specified
-		cfg.StakepooldHosts = normalizeAddresses(cfg.StakepooldHosts,
-			activeNetParams.StakepooldRPCServerPort)
-		if len(cfg.StakepooldHosts) < 2 {
-			str := "%s: you must specify at least 2 stakepooldhosts"
-			err := fmt.Errorf(str, funcName)
-			fmt.Fprintln(os.Stderr, err)
-			return nil, nil, err
+		systemCerts, err := x509.SystemCertPool()
+		if err != nil {
+			return nil, nil, fmt.Errorf("getting systemcertpool: %v", err)
 		}
+		systemCerts.AddCert(cert)
+		cfg.SystemCerts = systemCerts
 
-		if len(cfg.StakepooldHosts) != len(cfg.StakepooldCerts) {
-			str := "%s: wallet configuration mismatch " +
-				"(stakepooldcerts and stakepooldhosts " +
-				"counts differ)"
-			err := fmt.Errorf(str, funcName)
-			fmt.Fprintln(os.Stderr, err)
-			return nil, nil, err
+		if cfg.SMTPSkipVerify {
+			log.Warnf("SMTPCert has been set so SMTPSkipVerify is being disregarded.")
 		}
+	}
 
-		for idx := range cfg.StakepooldCerts {
-			if !fileExists(cfg.StakepooldCerts[idx]) {
-				path := filepath.Join(dcrstakepoolHomeDir,
-					cfg.StakepooldCerts[idx])
-				if !fileExists(path) {
-					str := "%s: stakepooldcert " +
-						cfg.StakepooldCerts[idx] +
-						" and " + path + " don't exist"
-					err := fmt.Errorf(str, funcName)
-					fmt.Fprintln(os.Stderr, err)
-					return nil, nil, err
-				}
+	// Warn about deprecated config items if they have been set
 
-				cfg.StakepooldCerts[idx] = path
-			}
-		}
+	if cfg.Profile != "" {
+		str := "%s: Config Profile is deprecated and has no effect. Please remove from your config file"
+		log.Warnf(str, funcName)
+	}
+
+	if cfg.CPUProfile != "" {
+		str := "%s: Config CPUProfile is deprecated and has no effect. Please remove from your config file"
+		log.Warnf(str, funcName)
+	}
+
+	if cfg.MemProfile != "" {
+		str := "%s: Config MemProfile is deprecated and has no effect. Please remove from your config file"
+		log.Warnf(str, funcName)
 	}
 
 	// Warn about missing config file only after all other configuration is
